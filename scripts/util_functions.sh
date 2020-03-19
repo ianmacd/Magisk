@@ -86,23 +86,40 @@ setup_flashable() {
 }
 
 ensure_bb() {
-  [ -o standalone ] && return
-  set -o standalone 2>/dev/null && return
+  if set -o | grep -q standalone; then
+    # We are definitely in busybox ash
+    set -o standalone
+    return
+  fi
 
-  # At this point, we are not running in BusyBox ash
   # Find our busybox binary
-  local BUSYBOX
+  local bb
   if [ -f $TMPDIR/busybox ]; then
-    BUSYBOX=$TMPDIR/busybox
+    bb=$TMPDIR/busybox
   elif [ -f $MAGISKBIN/busybox ]; then
-    BUSYBOX=$MAGISKBIN/busybox
+    bb=$MAGISKBIN/busybox
   else
     abort "! Cannot find BusyBox"
   fi
+  chmod 755 $bb
+
+  # Find our current arguments
+  # Run in busybox environment to ensure consistent results
+  # /proc/<pid>/cmdline shall be <interpreter> <script> <arguments...>
+  local cmds=$($bb sh -o standalone -c "
+  tr '\0' '\n' < /proc/$$/cmdline | (while read -r arg; do
+    if [ -z \"\$cmds\" ]; then
+      # Skip the first argument as we want to change the interpreter
+      cmds=\"sh -o standalone\"
+    else
+      cmds=\"\$cmds '\$arg'\"
+    fi
+  done
+  echo \$cmds)")
 
   # Re-exec our script
-  chmod 755 $BUSYBOX
-  exec $BUSYBOX sh -o standalone $0 "$@"
+  echo $cmds | $bb xargs $bb
+  exit
 }
 
 recovery_actions() {
@@ -376,8 +393,11 @@ flash_image() {
     local blk_sz=`blockdev --getsize64 "$2"`
     [ $img_sz -gt $blk_sz ] && return 1
     eval $CMD1 | eval $CMD2 | cat - /dev/zero > "$2" 2>/dev/null
+  elif [ -c "$2" ]; then
+    flash_eraseall "$2"
+    eval $CMD1 | eval $CMD2 | nandwrite -p "$2" -
   else
-    ui_print "- Not block device, storing image"
+    ui_print "- Not block or char device, storing image"
     eval $CMD1 | eval $CMD2 > "$2" 2>/dev/null
   fi
   return 0
@@ -408,6 +428,13 @@ patch_dtb_partitions() {
 install_magisk() {
   cd $MAGISKBIN
 
+  # Dump image for MTD/NAND character device boot partitions
+  if [ -c $BOOTIMAGE ]; then
+    nanddump -f boot.img $BOOTIMAGE
+    local BOOTNAND=$BOOTIMAGE
+    BOOTIMAGE=boot.img
+  fi
+
   eval $BOOTSIGNER -verify < $BOOTIMAGE && BOOTSIGNED=true
   $BOOTSIGNED && ui_print "- Boot image is signed with AVB 1.0"
 
@@ -418,6 +445,9 @@ install_magisk() {
   . ./boot_patch.sh "$BOOTIMAGE"
 
   ui_print "- Flashing new boot image"
+
+  # Restore the original boot partition path
+  [ "$BOOTNAND" ] && BOOTIMAGE=$BOOTNAND
 
   if ! flash_image new-boot.img "$BOOTIMAGE"; then
     ui_print "- Compressing ramdisk to fit in partition"
@@ -598,6 +628,9 @@ is_legacy_script() {
 # Require OUTFD, ZIPFILE to be set
 install_module() {
   local PERSISTDIR=/sbin/.magisk/mirror/persist
+
+  rm -rf $TMPDIR
+  mkdir -p $TMPDIR
 
   setup_flashable
   mount_partitions
