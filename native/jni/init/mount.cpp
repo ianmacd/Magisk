@@ -97,6 +97,7 @@ static bool read_dt_fstab(cmdline *cmd, const char *name) {
 	if ((fd = open(path, O_RDONLY | O_CLOEXEC)) >= 0) {
 		read(fd, path, sizeof(path));
 		close(fd);
+		path[strcspn(path, "\r\n")] = '\0';
 		// Some custom treble use different names, so use what we read
 		char *part = rtrim(strrchr(path, '/') + 1);
 		sprintf(partname, "%s%s", part, strend(part, cmd->slot) ? cmd->slot : "");
@@ -104,6 +105,7 @@ static bool read_dt_fstab(cmdline *cmd, const char *name) {
 		if ((fd = xopen(path, O_RDONLY | O_CLOEXEC)) >= 0) {
 			read(fd, fstype, 32);
 			close(fd);
+			fstype[strcspn(fstype, "\r\n")] = '\0';
 			return true;
 		}
 	}
@@ -121,6 +123,7 @@ if (!is_lnk("/" #name) && read_dt_fstab(cmd, #name)) { \
 
 static void switch_root(const string &path) {
 	LOGD("Switch root to %s\n", path.data());
+	int root = xopen("/", O_RDONLY);
 	vector<string> mounts;
 	parse_mnt("/proc/mounts", [&](mntent *me) {
 		// Skip root and self
@@ -142,6 +145,9 @@ static void switch_root(const string &path) {
 	chdir(path.data());
 	xmount(path.data(), "/", nullptr, MS_MOVE, nullptr);
 	chroot(".");
+
+	LOGD("Cleaning rootfs\n");
+	frm_rf(root);
 }
 
 static void mount_persist(const char *dev_base, const char *mnt_base) {
@@ -183,27 +189,15 @@ void RootFSInit::early_mount() {
 	mount_list.emplace_back("/dev/mnt/cache");
 }
 
-void SARBase::backup_files(const char *self_path) {
+void SARBase::backup_files() {
 	if (access("/overlay.d", F_OK) == 0)
-		cp_afc("/overlay.d", "/dev/overlay.d");
+		backup_folder("/overlay.d", overlays);
 
-	full_read(self_path, self.buf, self.sz);
+	full_read("/proc/self/exe", self.buf, self.sz);
 	full_read("/.backup/.magisk", config.buf, config.sz);
 }
 
-void SARInit::early_mount() {
-	// Make dev writable
-	xmkdir("/dev", 0755);
-	xmount("tmpfs", "/dev", "tmpfs", 0, "mode=755");
-	mount_list.emplace_back("/dev");
-
-	backup_files("/init");
-
-	LOGD("Cleaning rootfs\n");
-	int root = xopen("/", O_RDONLY | O_CLOEXEC);
-	frm_rf(root, { "proc", "sys", "dev" });
-	close(root);
-
+void SARBase::mount_system_root() {
 	LOGD("Early mount system_root\n");
 	sprintf(partname, "system%s", cmd->slot);
 	strcpy(block_dev, "/dev/root");
@@ -221,6 +215,17 @@ void SARInit::early_mount() {
 	xmkdir("/system_root", 0755);
 	if (xmount("/dev/root", "/system_root", "ext4", MS_RDONLY, nullptr))
 		xmount("/dev/root", "/system_root", "erofs", MS_RDONLY, nullptr);
+}
+
+void SARInit::early_mount() {
+	// Make dev writable
+	xmkdir("/dev", 0755);
+	xmount("tmpfs", "/dev", "tmpfs", 0, "mode=755");
+	mount_list.emplace_back("/dev");
+
+	backup_files();
+
+	mount_system_root();
 	switch_root("/system_root");
 
 	mount_root(vendor);
@@ -228,15 +233,22 @@ void SARInit::early_mount() {
 	mount_root(odm);
 }
 
-void SecondStageInit::early_mount() {
-	// Early mounts should already be done by first stage init
+void SARFirstStageInit::early_mount() {
+	backup_files();
+	mount_system_root();
+	switch_root("/system_root");
+}
 
-	backup_files("/system/bin/init");
+void SecondStageInit::early_mount() {
+	backup_files();
 	rm_rf("/system");
 	rm_rf("/.backup");
 	rm_rf("/overlay.d");
 
-	switch_root("/system_root");
+	umount2("/system/bin/init", MNT_DETACH);
+
+	if (access("/system_root", F_OK) == 0)
+		switch_root("/system_root");
 }
 
 void BaseInit::cleanup() {

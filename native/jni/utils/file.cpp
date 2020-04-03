@@ -18,59 +18,46 @@ ssize_t fd_path(int fd, char *path, size_t size) {
 }
 
 int fd_pathat(int dirfd, const char *name, char *path, size_t size) {
-	ssize_t len = fd_path(dirfd, path, size);
-	if (len < 0)
+	if (fd_path(dirfd, path, size) < 0)
 		return -1;
+	auto len = strlen(path);
 	path[len] = '/';
-	strlcpy(&path[len + 1], name, size - len - 1);
+	strlcpy(path + len + 1, name, size - len - 1);
 	return 0;
 }
 
-int mkdirs(const char *pathname, mode_t mode) {
-	char *path = strdup(pathname), *p;
+int mkdirs(string path, mode_t mode) {
 	errno = 0;
-	for (p = path + 1; *p; ++p) {
+	for (char *p = path.data() + 1; *p; ++p) {
 		if (*p == '/') {
 			*p = '\0';
-			if (mkdir(path, mode) == -1) {
+			if (mkdir(path.data(), mode) == -1) {
 				if (errno != EEXIST)
 					return -1;
 			}
 			*p = '/';
 		}
 	}
-	if (mkdir(path, mode) == -1) {
+	if (mkdir(path.data(), mode) == -1) {
 		if (errno != EEXIST)
 			return -1;
 	}
-	free(path);
 	return 0;
 }
 
-static bool is_excl(initializer_list<const char *> excl, const char *name) {
-	for (auto item : excl)
-		if (strcmp(item, name) == 0)
-			return true;
-	return false;
+#define SKIP_DOTS {\
+if (entry->d_name == "."sv || entry->d_name == ".."sv) \
+	continue;\
 }
 
-static void post_order_walk(int dirfd, initializer_list<const char *> excl,
-		int (*fn)(int, struct dirent *)) {
-	struct dirent *entry;
-	int newfd;
-	DIR *dir = fdopendir(dirfd);
-	if (dir == nullptr) return;
+static void post_order_walk(int dirfd, const function<int(int, dirent *)> &&fn) {
+	auto dir = xopen_dir(dirfd);
+	if (!dir) return;
 
-	while ((entry = xreaddir(dir))) {
-		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-			continue;
-		if (is_excl(excl, entry->d_name))
-			continue;
-		if (entry->d_type == DT_DIR) {
-			newfd = xopenat(dirfd, entry->d_name, O_RDONLY | O_CLOEXEC);
-			post_order_walk(newfd, excl, fn);
-			close(newfd);
-		}
+	for (dirent *entry; (entry = xreaddir(dir.get()));) {
+		SKIP_DOTS
+		if (entry->d_type == DT_DIR)
+			post_order_walk(xopenat(dirfd, entry->d_name, O_RDONLY | O_CLOEXEC), std::move(fn));
 		fn(dirfd, entry);
 	}
 }
@@ -83,170 +70,136 @@ void rm_rf(const char *path) {
 	struct stat st;
 	if (lstat(path, &st) < 0)
 		return;
-	if (S_ISDIR(st.st_mode)) {
-		int fd = open(path, O_RDONLY | O_CLOEXEC);
-		frm_rf(fd);
-		close(fd);
-	}
+	if (S_ISDIR(st.st_mode))
+		frm_rf(xopen(path, O_RDONLY | O_CLOEXEC));
 	remove(path);
 }
 
-void frm_rf(int dirfd, initializer_list<const char *> excl) {
-	post_order_walk(dirfd, excl, remove_at);
+void frm_rf(int dirfd) {
+	post_order_walk(dirfd, remove_at);
 }
 
-/* This will only on the same file system */
-void mv_f(const char *source, const char *destination) {
-	struct stat st;
-	xlstat(source, &st);
-	int src, dest;
-	struct file_attr a;
-
-	if (S_ISDIR(st.st_mode)) {
-		xmkdirs(destination, st.st_mode & 0777);
-		src = xopen(source, O_RDONLY | O_CLOEXEC);
-		dest = xopen(destination, O_RDONLY | O_CLOEXEC);
-		fclone_attr(src, dest);
-		mv_dir(src, dest);
-		close(src);
-		close(dest);
+void mv_path(const char *src, const char *dest) {
+	file_attr a;
+	getattr(src, &a);
+	if (S_ISDIR(a.st.st_mode)) {
+		xmkdirs(dest, 0);
+		setattr(dest, &a);
+		mv_dir(xopen(src, O_RDONLY | O_CLOEXEC), xopen(dest, O_RDONLY | O_CLOEXEC));
 	} else{
-		getattr(source, &a);
-		xrename(source, destination);
-		setattr(destination, &a);
+		xrename(src, dest);
 	}
-	rmdir(source);
+	rmdir(src);
 }
 
-/* This will only on the same file system */
 void mv_dir(int src, int dest) {
-	struct dirent *entry;
-	DIR *dir;
-	int newsrc, newdest;
-	struct file_attr a;
-
-	dir = xfdopendir(src);
-	while ((entry = xreaddir(dir))) {
-		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-			continue;
-		getattrat(src, entry->d_name, &a);
+	auto dir = xopen_dir(src);
+	run_finally f([&]{ close(dest); });
+	for (dirent *entry; (entry = xreaddir(dir.get()));) {
+		SKIP_DOTS
 		switch (entry->d_type) {
 		case DT_DIR:
-			xmkdirat(dest, entry->d_name, a.st.st_mode & 0777);
-			newsrc = xopenat(src, entry->d_name, O_RDONLY | O_CLOEXEC);
-			newdest = xopenat(dest, entry->d_name, O_RDONLY | O_CLOEXEC);
-			fsetattr(newdest, &a);
-			mv_dir(newsrc, newdest);
-			close(newsrc);
-			close(newdest);
-			unlinkat(src, entry->d_name, AT_REMOVEDIR);
-			break;
+			if (faccessat(dest, entry->d_name, F_OK, 0) == 0) {
+				// Destination folder exists, needs recursive move
+				int newsrc = xopenat(src, entry->d_name, O_RDONLY | O_CLOEXEC);
+				int newdest = xopenat(dest, entry->d_name, O_RDONLY | O_CLOEXEC);
+				mv_dir(newsrc, newdest);
+				unlinkat(src, entry->d_name, AT_REMOVEDIR);
+				break;
+			}
+			// Else fall through
 		case DT_LNK:
 		case DT_REG:
 			renameat(src, entry->d_name, dest, entry->d_name);
-			setattrat(dest, entry->d_name, &a);
 			break;
 		}
 	}
 }
 
-void cp_afc(const char *source, const char *destination) {
-	int src, dest;
-	struct file_attr a;
-	getattr(source, &a);
+void cp_afc(const char *src, const char *dest) {
+	file_attr a;
+	getattr(src, &a);
 
 	if (S_ISDIR(a.st.st_mode)) {
-		xmkdirs(destination, a.st.st_mode & 0777);
-		src = xopen(source, O_RDONLY | O_CLOEXEC);
-		dest = xopen(destination, O_RDONLY | O_CLOEXEC);
-		clone_dir(src, dest);
-		close(src);
-		close(dest);
+		xmkdirs(dest, 0);
+		clone_dir(xopen(src, O_RDONLY | O_CLOEXEC), xopen(dest, O_RDONLY | O_CLOEXEC));
 	} else{
-		unlink(destination);
+		unlink(dest);
 		if (S_ISREG(a.st.st_mode)) {
-			src = xopen(source, O_RDONLY);
-			dest = xopen(destination, O_WRONLY | O_CREAT | O_TRUNC);
-			xsendfile(dest, src, nullptr, a.st.st_size);
-			close(src);
-			close(dest);
+			int sfd = xopen(src, O_RDONLY | O_CLOEXEC);
+			int dfd = xopen(dest, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC);
+			xsendfile(dfd, sfd, nullptr, a.st.st_size);
+			close(sfd);
+			close(dfd);
 		} else if (S_ISLNK(a.st.st_mode)) {
-			char buf[PATH_MAX];
-			xreadlink(source, buf, sizeof(buf));
-			xsymlink(buf, destination);
+			char buf[4096];
+			xreadlink(src, buf, sizeof(buf));
+			xsymlink(buf, dest);
 		}
 	}
-	setattr(destination, &a);
+	setattr(dest, &a);
 }
 
-void clone_dir(int src, int dest, bool overwrite) {
-	struct dirent *entry;
-	DIR *dir;
-	int srcfd, destfd, newsrc, newdest;
-	char buf[PATH_MAX];
-	struct file_attr a;
-
-	dir = xfdopendir(src);
-	while ((entry = xreaddir(dir))) {
-		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-			continue;
-		if (struct stat st; !overwrite &&
-				fstatat(dest, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0)
-			continue;
+void clone_dir(int src, int dest) {
+	auto dir = xopen_dir(src);
+	run_finally f([&]{ close(dest); });
+	for (dirent *entry; (entry = xreaddir(dir.get()));) {
+		SKIP_DOTS
+		file_attr a;
 		getattrat(src, entry->d_name, &a);
 		switch (entry->d_type) {
-		case DT_DIR:
-			xmkdirat(dest, entry->d_name, a.st.st_mode & 0777);
-			setattrat(dest, entry->d_name, &a);
-			newsrc = xopenat(src, entry->d_name, O_RDONLY | O_CLOEXEC);
-			newdest = xopenat(dest, entry->d_name, O_RDONLY | O_CLOEXEC);
-			clone_dir(newsrc, newdest, overwrite);
-			close(newsrc);
-			close(newdest);
-			break;
-		case DT_REG:
-			destfd = xopenat(dest, entry->d_name, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC);
-			srcfd = xopenat(src, entry->d_name, O_RDONLY | O_CLOEXEC);
-			xsendfile(destfd, srcfd, nullptr, a.st.st_size);
-			fsetattr(destfd, &a);
-			close(destfd);
-			close(srcfd);
-			break;
-		case DT_LNK:
-			xreadlinkat(src, entry->d_name, buf, sizeof(buf));
-			xsymlinkat(buf, dest, entry->d_name);
-			setattrat(dest, entry->d_name, &a);
-			break;
+			case DT_DIR: {
+				xmkdirat(dest, entry->d_name, 0);
+				setattrat(dest, entry->d_name, &a);
+				int sfd = xopenat(src, entry->d_name, O_RDONLY | O_CLOEXEC);
+				int dst = xopenat(dest, entry->d_name, O_RDONLY | O_CLOEXEC);
+				clone_dir(sfd, dst);
+				break;
+			}
+			case DT_REG: {
+				int sfd = xopenat(src, entry->d_name, O_RDONLY | O_CLOEXEC);
+				int dfd = xopenat(dest, entry->d_name, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC);
+				xsendfile(dfd, sfd, nullptr, a.st.st_size);
+				fsetattr(dfd, &a);
+				close(dfd);
+				close(sfd);
+				break;
+			}
+			case DT_LNK: {
+				char buf[4096];
+				xreadlinkat(src, entry->d_name, buf, sizeof(buf));
+				xsymlinkat(buf, dest, entry->d_name);
+				setattrat(dest, entry->d_name, &a);
+				break;
+			}
 		}
 	}
+}
+
+void link_path(const char *src, const char *dest) {
+	link_dir(xopen(src, O_RDONLY | O_CLOEXEC), xopen(dest, O_RDONLY | O_CLOEXEC));
 }
 
 void link_dir(int src, int dest) {
-	struct dirent *entry;
-	DIR *dir;
-	int newsrc, newdest;
-	struct file_attr a;
-
-	dir = xfdopendir(src);
-	while ((entry = xreaddir(dir))) {
-		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-			continue;
+	auto dir = xopen_dir(src);
+	run_finally f([&]{ close(dest); });
+	for (dirent *entry; (entry = xreaddir(dir.get()));) {
+		SKIP_DOTS
 		if (entry->d_type == DT_DIR) {
+			file_attr a;
 			getattrat(src, entry->d_name, &a);
-			xmkdirat(dest, entry->d_name, a.st.st_mode & 0777);
+			xmkdirat(dest, entry->d_name, 0);
 			setattrat(dest, entry->d_name, &a);
-			newsrc = xopenat(src, entry->d_name, O_RDONLY | O_CLOEXEC);
-			newdest = xopenat(dest, entry->d_name, O_RDONLY | O_CLOEXEC);
-			link_dir(newsrc, newdest);
-			close(newsrc);
-			close(newdest);
+			int sfd = xopenat(src, entry->d_name, O_RDONLY | O_CLOEXEC);
+			int dfd = xopenat(dest, entry->d_name, O_RDONLY | O_CLOEXEC);
+			link_dir(sfd, dfd);
 		} else {
 			xlinkat(src, entry->d_name, dest, entry->d_name, 0);
 		}
 	}
 }
 
-int getattr(const char *path, struct file_attr *a) {
+int getattr(const char *path, file_attr *a) {
 	if (xlstat(path, &a->st) == -1)
 		return -1;
 	char *con;
@@ -257,13 +210,13 @@ int getattr(const char *path, struct file_attr *a) {
 	return 0;
 }
 
-int getattrat(int dirfd, const char *name, struct file_attr *a) {
+int getattrat(int dirfd, const char *name, file_attr *a) {
 	char path[4096];
 	fd_pathat(dirfd, name, path, sizeof(path));
 	return getattr(path, a);
 }
 
-int fgetattr(int fd, struct file_attr *a) {
+int fgetattr(int fd, file_attr *a) {
 	if (xfstat(fd, &a->st) < 0)
 		return -1;
 	char *con;
@@ -274,7 +227,7 @@ int fgetattr(int fd, struct file_attr *a) {
 	return 0;
 }
 
-int setattr(const char *path, struct file_attr *a) {
+int setattr(const char *path, file_attr *a) {
 	if (chmod(path, a->st.st_mode & 0777) < 0)
 		return -1;
 	if (chown(path, a->st.st_uid, a->st.st_gid) < 0)
@@ -284,13 +237,13 @@ int setattr(const char *path, struct file_attr *a) {
 	return 0;
 }
 
-int setattrat(int dirfd, const char *name, struct file_attr *a) {
+int setattrat(int dirfd, const char *name, file_attr *a) {
 	char path[4096];
 	fd_pathat(dirfd, name, path, sizeof(path));
 	return setattr(path, a);
 }
 
-int fsetattr(int fd, struct file_attr *a) {
+int fsetattr(int fd, file_attr *a) {
 	if (fchmod(fd, a->st.st_mode & 0777) < 0)
 		return -1;
 	if (fchown(fd, a->st.st_uid, a->st.st_gid) < 0)
@@ -300,16 +253,16 @@ int fsetattr(int fd, struct file_attr *a) {
 	return 0;
 }
 
-void clone_attr(const char *source, const char *target) {
-	struct file_attr a;
-	getattr(source, &a);
-	setattr(target, &a);
+void clone_attr(const char *src, const char *dest) {
+	file_attr a;
+	getattr(src, &a);
+	setattr(dest, &a);
 }
 
-void fclone_attr(int sourcefd, int targetfd) {
-	struct file_attr a;
-	fgetattr(sourcefd, &a);
-	fsetattr(targetfd, &a);
+void fclone_attr(int src, int dest) {
+	file_attr a;
+	fgetattr(src, &a);
+	fsetattr(dest, &a);
 }
 
 void *__mmap(const char *filename, size_t *size, bool rw) {
@@ -355,7 +308,7 @@ void write_zero(int fd, size_t size) {
 	}
 }
 
-void file_readline(bool trim, const char *file, const std::function<bool(std::string_view)> &fn) {
+void file_readline(bool trim, const char *file, const function<bool(string_view)> &fn) {
 	FILE *fp = xfopen(file, "re");
 	if (fp == nullptr)
 		return;
@@ -379,7 +332,7 @@ void file_readline(bool trim, const char *file, const std::function<bool(std::st
 	free(buf);
 }
 
-void parse_prop_file(const char *file, const function<bool (string_view, string_view)> &fn) {
+void parse_prop_file(const char *file, const function<bool(string_view, string_view)> &&fn) {
 	file_readline(true, file, [&](string_view line_view) -> bool {
 		char *line = (char *) line_view.data();
 		if (line[0] == '#')
@@ -392,8 +345,8 @@ void parse_prop_file(const char *file, const function<bool (string_view, string_
 	});
 }
 
-void parse_mnt(const char *file, const function<bool (mntent*)> &fn) {
-	unique_ptr<FILE, decltype(&endmntent)> fp(setmntent(file, "re"), &endmntent);
+void parse_mnt(const char *file, const function<bool(mntent*)> &fn) {
+	auto fp = sFILE(setmntent(file, "re"), endmntent);
 	if (fp) {
 		mntent mentry{};
 		char buf[4096];
@@ -401,5 +354,50 @@ void parse_mnt(const char *file, const function<bool (mntent*)> &fn) {
 			if (!fn(&mentry))
 				break;
 		}
+	}
+}
+
+void backup_folder(const char *dir, vector<raw_file> &files) {
+	char path[4096];
+	realpath(dir, path);
+	int len = strlen(path);
+	post_order_walk(xopen(dir, O_RDONLY), [&](int dfd, dirent *entry) -> int {
+		int fd = xopenat(dfd, entry->d_name, O_RDONLY);
+		if (fd < 0)
+			return -1;
+		run_finally f([&]{ close(fd); });
+		if (fd_path(fd, path, sizeof(path)) < 0)
+			return -1;
+		raw_file file;
+		file.path = path + len + 1;
+		if (fgetattr(fd, &file.attr) < 0)
+			return -1;
+		if (entry->d_type == DT_REG) {
+			fd_full_read(fd, file.buf, file.sz);
+		} else if (entry->d_type == DT_LNK) {
+			xreadlinkat(dfd, entry->d_name, path, sizeof(path));
+			file.sz = strlen(path) + 1;
+			file.buf = (uint8_t *) xmalloc(file.sz);
+			memcpy(file.buf, path, file.sz);
+		}
+		files.emplace_back(std::move(file));
+		return 0;
+	});
+}
+
+void restore_folder(const char *dir, vector<raw_file> &files) {
+	string base(dir);
+	// Reversed post-order means folders will always be first
+	for (raw_file &file : reversed(files)) {
+		string path = base + "/" + file.path;
+		if (S_ISDIR(file.attr.st.st_mode)) {
+			mkdirs(path.data(), 0);
+		} else if (S_ISREG(file.attr.st.st_mode)) {
+			auto fp = xopen_file(path.data(), "we");
+			fwrite(file.buf, 1, file.sz, fp.get());
+		} else if (S_ISLNK(file.attr.st.st_mode)) {
+			symlink((char *)file.buf, path.data());
+		}
+		setattr(path.data(), &file.attr);
 	}
 }
