@@ -11,11 +11,6 @@
 
 using namespace std;
 
-#define SKIP_DOTS {\
-if (entry->d_name == "."sv || entry->d_name == ".."sv) \
-	continue;\
-}
-
 #ifdef MAGISK_DEBUG
 #define VLOGI(tag, from, to) LOGI("%-8s: %s <- %s\n", tag, to, from)
 #else
@@ -27,6 +22,7 @@ if (entry->d_name == "."sv || entry->d_name == ".."sv) \
 #define TYPE_SKEL    (1 << 2)    /* replace with tmpfs */
 #define TYPE_MODULE  (1 << 3)    /* mount from module */
 #define TYPE_ROOT    (1 << 4)    /* partition root */
+#define TYPE_CUSTOM  (1 << 5)    /* custom node type overrides all */
 #define TYPE_DIR     (TYPE_INTER|TYPE_MIRROR|TYPE_SKEL|TYPE_ROOT)
 
 vector<string> module_list;
@@ -48,7 +44,7 @@ static int bind_mount(const char *from, const char *to) {
 	return ret;
 }
 
-template<class T> uint8_t type_id() { return 0; }
+template<class T> uint8_t type_id() { return TYPE_CUSTOM; }
 template<> uint8_t type_id<dir_node>() { return TYPE_DIR; }
 template<> uint8_t type_id<inter_node>() { return TYPE_INTER; }
 template<> uint8_t type_id<mirror_node>() { return TYPE_MIRROR; }
@@ -67,6 +63,10 @@ public:
 	uint8_t type() { return node_type; }
 	const string &name() { return _name; }
 
+	// Paths
+	const string &node_path();
+	string mirror_path() { return mirror_dir + node_path(); }
+
 	dir_node *parent() { return _parent; }
 
 	virtual void mount() = 0;
@@ -81,10 +81,6 @@ protected:
 
 	template<class T>
 	node_entry(T*) : node_type(type_id<T>()) {}
-
-	// Paths
-	const string &node_path();
-	string mirror_path() { return mirror_dir + node_path(); }
 
 	void create_and_mount(const string &src);
 
@@ -169,7 +165,7 @@ public:
 	template<class T, class ...Args>
 	T *emplace_or_get(string_view name, Args &...args) {
 		return iter_to_node<T>(insert(children.find(name), type_id<T>(),
-				[&](auto _) { return new T(std::forward<Args>(args)...); }, true));
+		        [&](auto _) { return new T(std::forward<Args>(args)...); }, true));
 	}
 
 	// Return upgraded node or null if rejected
@@ -440,7 +436,6 @@ bool dir_node::prepare() {
 			string mirror = skel->mirror_path();
 			auto dir = xopen_dir(mirror.data());
 			for (dirent *entry; (entry = xreaddir(dir.get()));) {
-				SKIP_DOTS
 				// Insert mirror nodes
 				skel->emplace<mirror_node>(entry->d_name, entry);
 			}
@@ -457,7 +452,6 @@ bool dir_node::collect_files(const char *module, int dfd) {
 		return true;
 
 	for (dirent *entry; (entry = xreaddir(dir.get()));) {
-		SKIP_DOTS
 		if (entry->d_name == ".replace"sv) {
 			// Stop traversing and tell parent to upgrade self to module
 			return false;
@@ -475,6 +469,47 @@ bool dir_node::collect_files(const char *module, int dfd) {
 		}
 	}
 	return true;
+}
+
+class magisk_node : public node_entry {
+public:
+	magisk_node(const char *name) : node_entry(name, DT_REG, this) {}
+
+	void mount() override {
+		const string &dir_name = parent()->node_path();
+		if (name() == "magisk") {
+			for (int i = 0; applet_names[i]; ++i) {
+				string dest = dir_name + "/" + applet_names[i];
+				VLOGI("create", "./magisk", dest.data());
+				xsymlink("./magisk", dest.data());
+			}
+		} else {
+			for (int i = 0; init_applet[i]; ++i) {
+				string dest = dir_name + "/" + init_applet[i];
+				VLOGI("create", "./magiskinit", dest.data());
+				xsymlink("./magiskinit", dest.data());
+			}
+		}
+		create_and_mount(MAGISKTMP + "/" + name());
+	}
+};
+
+static void inject_magisk_bins(root_node *system) {
+	auto bin = system->child<inter_node>("bin");
+	if (!bin) {
+		bin = new inter_node("bin", "");
+		system->insert(bin);
+	}
+
+	// Insert binaries
+	bin->insert(new magisk_node("magisk"));
+	bin->insert(new magisk_node("magiskinit"));
+
+	// Also delete all applets to make sure no modules can override it
+	for (int i = 0; applet_names[i]; ++i)
+		delete bin->extract(applet_names[i]);
+	for (int i = 0; init_applet[i]; ++i)
+		delete bin->extract(init_applet[i]);
 }
 
 static void mount_modules() {
@@ -525,6 +560,12 @@ static void mount_modules() {
 		system->collect_files(module, fd);
 		close(fd);
 	}
+
+	if (MAGISKTMP != "/sbin") {
+		// Need to inject our binaries into /system/bin
+		inject_magisk_bins(system);
+	}
+
 	if (system->is_empty())
 		return;
 
@@ -550,8 +591,6 @@ static void prepare_modules() {
 		int mfd = xopen(MODULEROOT, O_RDONLY | O_CLOEXEC);
 		for (dirent *entry; (entry = xreaddir(dir.get()));) {
 			if (entry->d_type == DT_DIR) {
-				if (entry->d_name == "."sv || entry->d_name == ".."sv)
-					continue;
 				// Cleanup old module if exists
 				if (faccessat(mfd, entry->d_name, F_OK, 0) == 0) {
 					frm_rf(xopenat(mfd, entry->d_name, O_RDONLY | O_CLOEXEC));
@@ -579,7 +618,7 @@ static void collect_modules() {
 	int dfd = dirfd(dir.get());
 	for (dirent *entry; (entry = xreaddir(dir.get()));) {
 		if (entry->d_type == DT_DIR) {
-			if (entry->d_name == "."sv || entry->d_name == ".."sv || entry->d_name == ".core"sv)
+			if (entry->d_name == ".core"sv)
 				continue;
 
 			int modfd = xopenat(dfd, entry->d_name, O_RDONLY);
