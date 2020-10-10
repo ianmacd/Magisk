@@ -1,11 +1,7 @@
 #include <sys/mount.h>
 #include <sys/wait.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <string.h>
-#include <dirent.h>
+#include <sys/sysmacros.h>
+#include <linux/input.h>
 #include <libgen.h>
 #include <vector>
 #include <string>
@@ -19,11 +15,8 @@
 
 using namespace std;
 
-extern vector<string> module_list;
-static bool no_secure_dir = false;
 static bool pfs_done = false;
-
-extern void auto_start_magiskhide();
+static bool safe_mode = false;
 
 /*********
  * Setup *
@@ -33,14 +26,21 @@ extern void auto_start_magiskhide();
 #define SETMIR(b, part)   sprintf(b, "%s/" MIRRDIR "/" #part, MAGISKTMP.data())
 #define SETBLK(b, part)   sprintf(b, "%s/" BLOCKDIR "/" #part, MAGISKTMP.data())
 
-#define mount_mirror(part, flag) { \
-	xstat(me->mnt_fsname, &st); \
+#define mount_mirror(part, flag) \
+else if (DIR_IS(part) && me->mnt_type != "tmpfs"sv && lstat(me->mnt_dir, &st) == 0) { \
 	SETMIR(buf1, part); \
 	SETBLK(buf2, part); \
-	mknod(buf2, (st.st_mode & S_IFMT) | 0600, st.st_rdev); \
+	mknod(buf2, S_IFBLK | 0600, st.st_dev); \
 	xmkdir(buf1, 0755); \
 	xmount(buf2, buf1, me->mnt_type, flag, nullptr); \
 	LOGI("mount: %s\n", buf1); \
+}
+
+#define link_mirror(part) \
+SETMIR(buf1, part); \
+if (access("/system/" #part, F_OK) == 0 && access(buf1, F_OK) != 0) { \
+	xsymlink("./system/" #part, buf1); \
+	LOGI("link: %s\n", buf1); \
 }
 
 static bool magisk_env() {
@@ -58,12 +58,12 @@ static bool magisk_env() {
 	const char *alt_bin[] = { "/cache/data_adb/magisk", "/data/magisk", buf1 };
 	for (auto alt : alt_bin) {
 		struct stat st;
-		if (lstat(alt, &st) != -1) {
+		if (lstat(alt, &st) == 0) {
 			if (S_ISLNK(st.st_mode)) {
 				unlink(alt);
 				continue;
 			}
-			rm_rf(DATABIN);;
+			rm_rf(DATABIN);
 			cp_afc(alt, DATABIN);
 			rm_rf(alt);
 			break;
@@ -81,9 +81,6 @@ static bool magisk_env() {
 
 	sprintf(buf1, "%s/" MODULEMNT, MAGISKTMP.data());
 	xmkdir(buf1, 0755);
-	// TODO: Remove. Backwards compatibility for old manager
-	sprintf(buf1, "%s/" INTLROOT "/img", MAGISKTMP.data());
-	xsymlink("./modules", buf1);
 
 	// Directories in /data/adb
 	xmkdir(DATABIN, 0755);
@@ -92,24 +89,16 @@ static bool magisk_env() {
 	xmkdir(SECURE_DIR "/service.d", 0755);
 
 	LOGI("* Mounting mirrors");
-	bool system_as_root = false;
-	struct stat st;
+
 	parse_mnt("/proc/mounts", [&](mntent *me) {
-		if (DIR_IS(system_root)) {
-			mount_mirror(system_root, MS_RDONLY);
-			SETMIR(buf1, system);
-			xsymlink("./system_root/system", buf1);
-			LOGI("link: %s\n", buf1);
-			system_as_root = true;
-		} else if (!system_as_root && DIR_IS(system)) {
-			mount_mirror(system, MS_RDONLY);
-		} else if (DIR_IS(vendor)) {
-			mount_mirror(vendor, MS_RDONLY);
-		} else if (DIR_IS(product)) {
-			mount_mirror(product, MS_RDONLY);
-		} else if (DIR_IS(data) && me->mnt_type != "tmpfs"sv) {
-			mount_mirror(data, 0);
-		} else if (SDK_INT >= 24 && DIR_IS(proc) && !strstr(me->mnt_opts, "hidepid=2")) {
+		struct stat st;
+		if (0) {}
+		mount_mirror(system, MS_RDONLY)
+		mount_mirror(vendor, MS_RDONLY)
+		mount_mirror(product, MS_RDONLY)
+		mount_mirror(system_ext, MS_RDONLY)
+		mount_mirror(data, 0)
+		else if (SDK_INT >= 24 && DIR_IS(proc) && !strstr(me->mnt_opts, "hidepid=2")) {
 			xmount(nullptr, "/proc", nullptr, MS_REMOUNT, "hidepid=2,gid=3009");
 		}
 		return true;
@@ -117,20 +106,12 @@ static bool magisk_env() {
 	SETMIR(buf1, system);
 	SETMIR(buf2, system_root);
 	if (access(buf1, F_OK) != 0 && access(buf2, F_OK) == 0) {
-		// Pre-init mirrors
 		xsymlink("./system_root/system", buf1);
 		LOGI("link: %s\n", buf1);
 	}
-	SETMIR(buf1, vendor);
-	if (access(buf1, F_OK) != 0) {
-		xsymlink("./system/vendor", buf1);
-		LOGI("link: %s\n", buf1);
-	}
-	SETMIR(buf1, product);
-	if (access("/system/product", F_OK) == 0 && access(buf1, F_OK) != 0) {
-		xsymlink("./system/product", buf1);
-		LOGI("link: %s\n", buf1);
-	}
+	link_mirror(vendor);
+	link_mirror(product);
+	link_mirror(system_ext);
 
 	// Disable/remove magiskhide, resetprop
 	if (SDK_INT < 19) {
@@ -151,54 +132,36 @@ static bool magisk_env() {
 	return true;
 }
 
-static void reboot() {
+void reboot() {
 	if (RECOVERY_MODE)
 		exec_command_sync("/system/bin/reboot", "recovery");
 	else
 		exec_command_sync("/system/bin/reboot");
 }
 
-void remove_modules() {
-	LOGI("* Remove all modules and reboot");
-	auto dir = xopen_dir(MODULEROOT);
-	int dfd = dirfd(dir.get());
-	for (dirent *entry; (entry = xreaddir(dir.get()));) {
-		if (entry->d_type == DT_DIR) {
-			if (entry->d_name == ".core"sv)
-				continue;
-
-			int modfd = xopenat(dfd, entry->d_name, O_RDONLY | O_CLOEXEC);
-			close(xopenat(modfd, "remove", O_RDONLY | O_CREAT | O_CLOEXEC));
-			close(modfd);
-		}
-	}
-	reboot();
-}
-
 static bool check_data() {
 	bool mnt = false;
-	bool data = false;
-	file_readline("/proc/mounts", [&](string_view s) -> bool {
-		if (str_contains(s, " /data ") && !str_contains(s, "tmpfs"))
+	file_readline("/proc/mounts", [&](string_view s) {
+		if (str_contains(s, " /data ") && !str_contains(s, "tmpfs")) {
 			mnt = true;
+			return false;
+		}
 		return true;
 	});
-	if (mnt) {
-		auto crypto = getprop("ro.crypto.state");
-		if (!crypto.empty()) {
-			if (crypto == "unencrypted") {
-				// Unencrypted, we can directly access data
-				data = true;
-			} else {
-				// Encrypted, check whether vold is started
-				data = !getprop("init.svc.vold").empty();
-			}
+	if (!mnt)
+		return false;
+	auto crypto = getprop("ro.crypto.state");
+	if (!crypto.empty()) {
+		if (crypto == "unencrypted") {
+			// Unencrypted, we can directly access data
+			return true;
 		} else {
-			// ro.crypto.state is not set, assume it's unencrypted
-			data = true;
+			// Encrypted, check whether vold is started
+			return !getprop("init.svc.vold").empty();
 		}
 	}
-	return data;
+	// ro.crypto.state is not set, assume it's unencrypted
+	return true;
 }
 
 void unlock_blocks() {
@@ -220,18 +183,23 @@ void unlock_blocks() {
 	}
 }
 
-static bool log_dump = false;
-static void dump_logs() {
-	if (log_dump)
-		return;
-	int test = exec_command_sync("/system/bin/logcat", "-d", "-f", "/dev/null");
-	chmod("/dev/null", 0666);
-	if (test != 0)
-		return;
-	rename(LOGFILE, LOGFILE ".bak");
-	log_dump = true;
+static void collect_logs(bool reset) {
+	static bool running = false;
+	static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+	{
+		mutex_guard lock(log_lock);
+		if (running)
+			return;
+		int test = exec_command_sync("/system/bin/logcat", "-d", "-f", "/dev/null");
+		chmod("/dev/null", 0666);
+		if (test != 0)
+			return;
+		running = true;
+	}
+	if (reset)
+		rename(LOGFILE, LOGFILE ".bak");
 	// Start a daemon thread and wait indefinitely
-	new_daemon_thread([]() -> void {
+	new_daemon_thread([]{
 		int fd = xopen(LOGFILE, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
 		exec_t exec {
 			.fd = fd,
@@ -240,27 +208,64 @@ static void dump_logs() {
 		int pid = exec_command(exec, "/system/bin/logcat", "-s", "Magisk");
 		close(fd);
 		if (pid < 0) {
-			log_dump = false;
+			mutex_guard lock(log_lock);
+			running = false;
 		} else {
 			waitpid(pid, nullptr, 0);
 		}
 	});
 }
 
+#define test_bit(bit, array) (array[bit / 8] & (1 << (bit % 8)))
+
+static bool check_key_combo() {
+	uint8_t bitmask[(KEY_MAX + 1) / 8];
+	vector<int> events;
+	constexpr char name[] = "/dev/.ev";
+
+	// First collect candidate events that accepts volume down
+	for (int minor = 64; minor < 96; ++minor) {
+		if (xmknod(name, S_IFCHR | 0444, makedev(13, minor)))
+			continue;
+		int fd = open(name, O_RDONLY | O_CLOEXEC);
+		unlink(name);
+		if (fd < 0)
+			continue;
+		memset(bitmask, 0, sizeof(bitmask));
+		ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(bitmask)), bitmask);
+		if (test_bit(KEY_VOLUMEDOWN, bitmask))
+			events.push_back(fd);
+		else
+			close(fd);
+	}
+	if (events.empty())
+		return false;
+
+	run_finally fin([&]{ std::for_each(events.begin(), events.end(), close); });
+
+	// Check if volume down key is held continuously for more than 3 seconds
+	for (int i = 0; i < 300; ++i) {
+		bool pressed = false;
+		for (const int &fd : events) {
+			memset(bitmask, 0, sizeof(bitmask));
+			ioctl(fd, EVIOCGKEY(sizeof(bitmask)), bitmask);
+			if (test_bit(KEY_VOLUMEDOWN, bitmask)) {
+				pressed = true;
+				break;
+			}
+		}
+		if (!pressed)
+			return false;
+		// Check every 10ms
+		usleep(10000);
+	}
+	LOGD("KEY_VOLUMEDOWN detected: enter safe mode\n");
+	return true;
+}
+
 /****************
  * Entry points *
  ****************/
-
-[[noreturn]] static void unblock_boot_process() {
-	close(xopen(UNBLOCKFILE, O_RDONLY | O_CREAT, 0));
-	pthread_exit(nullptr);
-}
-
-[[noreturn]] static void core_only() {
-	pfs_done = true;
-	auto_start_magiskhide();
-	unblock_boot_process();
-}
 
 void post_fs_data(int client) {
 	// ack
@@ -271,9 +276,9 @@ void post_fs_data(int client) {
 		xmount(nullptr, "/", nullptr, MS_REMOUNT | MS_RDONLY, nullptr);
 
 	if (!check_data())
-		unblock_boot_process();
+		goto unblock_init;
 
-	dump_logs();
+	collect_logs(true);
 
 	LOGI("** post-fs-data mode running\n");
 
@@ -281,29 +286,40 @@ void post_fs_data(int client) {
 	unlock_blocks();
 
 	if (access(SECURE_DIR, F_OK) != 0) {
-		/* If the folder is not automatically created by the system,
-		 * do NOT proceed further. Manual creation of the folder
-		 * will cause bootloops on FBE devices. */
-		LOGE(SECURE_DIR " is not present, abort...");
-		no_secure_dir = true;
-		unblock_boot_process();
+		if (SDK_INT < 24) {
+			// There is no FBE pre 7.0, we can directly create the folder without issues
+			xmkdir(SECURE_DIR, 0700);
+		} else {
+			/* If the folder is not automatically created by Android,
+			 * do NOT proceed further. Manual creation of the folder
+			 * will cause bootloops on FBE devices. */
+			LOGE(SECURE_DIR " is not present, abort...\n");
+			goto unblock_init;
+		}
 	}
 
 	if (!magisk_env()) {
 		LOGE("* Magisk environment setup incomplete, abort\n");
-		unblock_boot_process();
+		goto unblock_init;
 	}
 
-	LOGI("* Running post-fs-data.d scripts\n");
-	exec_common_script("post-fs-data");
+	if (getprop("persist.sys.safemode", true) == "1" || check_key_combo()) {
+		safe_mode = true;
+		// Disable all modules and magiskhide so next boot will be clean
+		foreach_modules("disable");
+		stop_magiskhide();
+	} else {
+		exec_common_scripts("post-fs-data");
+		auto_start_magiskhide();
+		handle_modules();
+	}
 
-	// Core only mode
-	if (access(DISABLEFILE, F_OK) == 0)
-		core_only();
+	// We still do magic mount because root itself might need it
+	magic_mount();
+	pfs_done = true;
 
-	handle_modules();
-
-	core_only();
+unblock_init:
+	close(xopen(UNBLOCKFILE, O_RDONLY | O_CREAT, 0));
 }
 
 void late_start(int client) {
@@ -312,33 +328,13 @@ void late_start(int client) {
 	write_int(client, 0);
 	close(client);
 
-	dump_logs();
+	collect_logs(false);
 
-	if (no_secure_dir) {
-		// It's safe to create the folder at this point if the system didn't create it
-		if (access(SECURE_DIR, F_OK) != 0)
-			xmkdir(SECURE_DIR, 0700);
-		// And reboot to make proper setup possible
-		reboot();
-	}
-
-	if (!pfs_done)
+	if (!pfs_done || safe_mode)
 		return;
 
-	auto_start_magiskhide();
-
-	LOGI("* Running service.d scripts\n");
-	exec_common_script("service");
-
-	// Core only mode
-	if (access(DISABLEFILE, F_OK) != 0) {
-		LOGI("* Running module service scripts\n");
-		exec_module_script("service", module_list);
-	}
-
-	// All boot stage done, cleanup
-	module_list.clear();
-	module_list.shrink_to_fit();
+	exec_common_scripts("service");
+	exec_module_scripts("service");
 }
 
 void boot_complete(int client) {
@@ -347,10 +343,18 @@ void boot_complete(int client) {
 	write_int(client, 0);
 	close(client);
 
-	if (!pfs_done)
+	collect_logs(false);
+
+	if (safe_mode)
 		return;
 
-	auto_start_magiskhide();
+	/* It's safe to create the folder at this point if the system didn't create it
+	 * Magisk Manager should finish up the remaining environment setup */
+	if (access(SECURE_DIR, F_OK) != 0)
+		xmkdir(SECURE_DIR, 0700);
+
+	if (pfs_done)
+		auto_start_magiskhide();
 
 	if (access(MANAGERAPK, F_OK) == 0) {
 		// Install Magisk Manager if exists
@@ -360,7 +364,8 @@ void boot_complete(int client) {
 		// Check whether we have manager installed
 		if (!check_manager()) {
 			// Install stub
-			exec_command_sync("/sbin/magiskinit", "-x", "manager", "/data/magisk.apk");
+			auto init = MAGISKTMP + "/magiskinit";
+			exec_command_sync(init.data(), "-x", "manager", "/data/magisk.apk");
 			install_apk("/data/magisk.apk");
 		}
 	}

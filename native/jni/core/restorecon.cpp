@@ -1,6 +1,7 @@
 #include <string_view>
 
 #include <magisk.hpp>
+#include <daemon.hpp>
 #include <selinux.hpp>
 #include <utils.hpp>
 
@@ -10,7 +11,8 @@ using namespace std;
 #define SYSTEM_CON  "u:object_r:system_file:s0"
 #define ADB_CON     "u:object_r:adb_data_file:s0"
 #define ROOT_CON    "u:object_r:rootfs:s0"
-#define MAGISK_CON  "u:object_r:" SEPOL_FILE_DOMAIN ":s0"
+#define MAGISK_CON  "u:object_r:" SEPOL_FILE_TYPE ":s0"
+#define EXEC_CON    "u:object_r:" SEPOL_EXEC_TYPE ":s0"
 
 static void restore_syscon(int dirfd) {
 	struct dirent *entry;
@@ -77,6 +79,13 @@ void restorecon() {
 }
 
 void restore_tmpcon() {
+	if (MAGISKTMP == "/system/bin") {
+		// Running with emulator.sh
+		if (SDK_INT >= 26)
+			lsetfilecon("/system/bin/magisk", EXEC_CON);
+		return;
+	}
+
 	if (MAGISKTMP == "/sbin")
 		setfilecon(MAGISKTMP.data(), ROOT_CON);
 	else
@@ -86,9 +95,9 @@ void restore_tmpcon() {
 	int dfd = dirfd(dir.get());
 
 	for (dirent *entry; (entry = xreaddir(dir.get()));) {
-		if (entry->d_name == "magisk"sv || entry->d_name == "magiskinit"sv)
-			setfilecon_at(dfd, entry->d_name, MAGISK_CON);
+		if (SDK_INT >= 26 && entry->d_name == "magisk"sv)
+			setfilecon_at(dfd, entry->d_name, EXEC_CON);
 		else
-			setfilecon_at(dfd, entry->d_name, ROOT_CON);
+			setfilecon_at(dfd, entry->d_name, SYSTEM_CON);
 	}
 }

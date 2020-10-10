@@ -13,21 +13,25 @@ import android.view.WindowManager
 import androidx.annotation.DrawableRes
 import androidx.annotation.StringRes
 import androidx.appcompat.app.AppCompatDialog
+import androidx.appcompat.content.res.AppCompatResources
 import androidx.core.view.ViewCompat
 import androidx.core.view.updatePadding
+import androidx.databinding.Bindable
+import androidx.databinding.PropertyChangeRegistry
 import androidx.databinding.ViewDataBinding
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.topjohnwu.magisk.BR
 import com.topjohnwu.magisk.R
+import com.topjohnwu.magisk.arch.itemBindingOf
 import com.topjohnwu.magisk.databinding.ComparableRvItem
 import com.topjohnwu.magisk.databinding.DialogMagiskBaseBinding
-import com.topjohnwu.magisk.ui.base.itemBindingOf
-import com.topjohnwu.magisk.utils.KObservableField
+import com.topjohnwu.magisk.utils.ObservableHost
+import com.topjohnwu.magisk.utils.set
 import me.tatarka.bindingcollectionadapter2.BindingRecyclerViewAdapters
 import me.tatarka.bindingcollectionadapter2.ItemBinding
 
-class MagiskDialog @JvmOverloads constructor(
+class MagiskDialog(
     context: Context, theme: Int = 0
 ) : AppCompatDialog(context, theme) {
 
@@ -51,10 +55,12 @@ class MagiskDialog @JvmOverloads constructor(
             )
         }
 
+        val paddingTop = binding.root.paddingTop
+        val paddingBottom = binding.root.paddingBottom
         ViewCompat.setOnApplyWindowInsetsListener(binding.root) { view, insets ->
             view.updatePadding(
-                top = view.paddingTop + insets.systemWindowInsetTop,
-                bottom = view.paddingBottom + insets.systemWindowInsetBottom
+                top = paddingTop + insets.systemWindowInsetTop,
+                bottom = paddingBottom + insets.systemWindowInsetBottom
             )
             insets
         }
@@ -70,11 +76,20 @@ class MagiskDialog @JvmOverloads constructor(
         binding.dialogBaseOutsideContainer.setOnClickListener(listener)
     }
 
-    inner class Data {
-        val icon = KObservableField(0)
-        val iconRaw = KObservableField<Drawable?>(null)
-        val title = KObservableField<CharSequence>("")
-        val message = KObservableField<CharSequence>("")
+    inner class Data: ObservableHost {
+        override var callbacks: PropertyChangeRegistry? = null
+
+        @get:Bindable
+        var icon: Drawable? = null
+            set(value) = set(value, field, { field = it }, BR.icon)
+
+        @get:Bindable
+        var title: CharSequence = ""
+            set(value) = set(value, field, { field = it }, BR.title)
+
+        @get:Bindable
+        var message : CharSequence = ""
+            set(value) = set(value, field, { field = it }, BR.message)
 
         val buttonPositive = Button()
         val buttonNeutral = Button()
@@ -86,10 +101,20 @@ class MagiskDialog @JvmOverloads constructor(
         POSITIVE, NEUTRAL, NEGATIVE, IDGAF
     }
 
-    inner class Button {
-        val icon = KObservableField(0)
-        val title = KObservableField<CharSequence>("")
-        val isEnabled = KObservableField(true)
+    inner class Button: ObservableHost {
+        override var callbacks: PropertyChangeRegistry? = null
+
+        @get:Bindable
+        var icon = 0
+            set(value) = set(value, field, { field = it }, BR.icon)
+
+        @get:Bindable
+        var title: CharSequence = ""
+            set(value) = set(value, field, { field = it }, BR.title)
+
+        @get:Bindable
+        var isEnabled = true
+            set(value) = set(value, field, { field = it }, BR.enabled)
 
         var onClickAction: OnDialogButtonClickListener = {}
         var preventDismiss = false
@@ -116,24 +141,24 @@ class MagiskDialog @JvmOverloads constructor(
 
     inner class ButtonBuilder(private val button: Button) {
         var icon: Int
-            get() = button.icon.value
+            get() = button.icon
             set(value) {
-                button.icon.value = value
+                button.icon = value
             }
         var title: CharSequence
-            get() = button.title.value
+            get() = button.title
             set(value) {
-                button.title.value = value
+                button.title = value
             }
         var titleRes: Int
             get() = 0
             set(value) {
-                button.title.value = context.getString(value)
+                button.title = context.getString(value)
             }
         var isEnabled: Boolean
-            get() = button.isEnabled.value
+            get() = button.isEnabled
             set(value) {
-                button.isEnabled.value = value
+                button.isEnabled = value
             }
         var preventDismiss: Boolean
             get() = button.preventDismiss
@@ -147,22 +172,24 @@ class MagiskDialog @JvmOverloads constructor(
     }
 
     fun applyTitle(@StringRes stringRes: Int) =
-        apply { data.title.value = context.getString(stringRes) }
+        apply { data.title = context.getString(stringRes) }
 
     fun applyTitle(title: CharSequence) =
-        apply { data.title.value = title }
+        apply { data.title = title }
 
     fun applyMessage(@StringRes stringRes: Int, vararg args: Any) =
-        apply { data.message.value = context.getString(stringRes, *args) }
+        apply { data.message = context.getString(stringRes, *args) }
 
     fun applyMessage(message: CharSequence) =
-        apply { data.message.value = message }
+        apply { data.message = message }
 
     fun applyIcon(@DrawableRes drawableRes: Int) =
-        apply { data.icon.value = drawableRes }
+        apply {
+            data.icon = AppCompatResources.getDrawable(context, drawableRes)
+        }
 
     fun applyIcon(drawable: Drawable) =
-        apply { data.iconRaw.value = drawable }
+        apply { data.icon = drawable }
 
     fun applyButton(buttonType: ButtonType, builder: ButtonBuilder.() -> Unit) = apply {
         val button = when (buttonType) {
@@ -227,6 +254,9 @@ class MagiskDialog @JvmOverloads constructor(
         )
     }
 
+    fun onCancel(callback: OnDialogButtonClickListener) =
+        apply { setOnCancelListener(callback) }
+
     fun onDismiss(callback: OnDialogButtonClickListener) =
         apply { setOnDismissListener(callback) }
 
@@ -243,7 +273,7 @@ class MagiskDialog @JvmOverloads constructor(
 
     fun resetTitle() = applyTitle("")
     fun resetMessage() = applyMessage("")
-    fun resetIcon() = applyIcon(0)
+    fun resetIcon() = apply { data.icon = null }
 
     fun resetButtons() = apply {
         ButtonType.values().forEach {

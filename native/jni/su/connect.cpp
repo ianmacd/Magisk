@@ -1,13 +1,9 @@
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <fcntl.h>
-#include <stdio.h>
 
 #include <daemon.hpp>
 #include <utils.hpp>
-#include <logging.hpp>
+#include <selinux.hpp>
 
 #include "su.hpp"
 
@@ -93,9 +89,9 @@ public:
 	}
 };
 
-static bool check_error(int fd) {
+static bool check_no_error(int fd) {
 	char buf[1024];
-	unique_ptr<FILE, decltype(&fclose)> out(xfdopen(fd, "r"), fclose);
+	auto out = xopen_file(fd, "r");
 	while (fgets(buf, sizeof(buf), out.get())) {
 		if (strncmp(buf, "Error", 5) == 0)
 			return false;
@@ -124,7 +120,7 @@ static void exec_cmd(const char *action, vector<Extra> &data,
 			.argv = args.data()
 		};
 		exec_command_sync(exec);
-		if (check_error(exec.fd))
+		if (check_no_error(exec.fd))
 			return;
 	}
 
@@ -144,7 +140,7 @@ static void exec_cmd(const char *action, vector<Extra> &data,
 		// Then try start activity without component name
 		strcpy(target, info->str[SU_MANAGER].data());
 		exec_command_sync(exec);
-		if (check_error(exec.fd))
+		if (check_no_error(exec.fd))
 			return;
 	}
 
@@ -184,15 +180,33 @@ void app_notify(const su_context &ctx) {
 	}
 }
 
-void app_socket(const char *socket, const shared_ptr<su_info> &info) {
+int app_request(const shared_ptr<su_info> &info) {
+	// Create FIFO
+	char fifo[64];
+	strcpy(fifo, "/dev/socket/");
+	gen_rand_str(fifo + 12, 32, true);
+	mkfifo(fifo, 0600);
+	chown(fifo, info->mgr_st.st_uid, info->mgr_st.st_gid);
+	setfilecon(fifo, "u:object_r:" SEPOL_FILE_TYPE ":s0");
+
+	// Send request
 	vector<Extra> extras;
-	extras.reserve(1);
-	extras.emplace_back("socket", socket);
-
+	extras.reserve(2);
+	extras.emplace_back("fifo", fifo);
+	extras.emplace_back("uid", info->uid);
 	exec_cmd("request", extras, info, PKG_ACTIVITY);
-}
 
-void socket_send_request(int fd, const shared_ptr<su_info> &info) {
-	write_key_token(fd, "uid", info->uid);
-	write_string_be(fd, "eof");
+	// Wait for data input for at most 70 seconds
+	int fd = xopen(fifo, O_RDONLY | O_CLOEXEC);
+	struct pollfd pfd = {
+		.fd = fd,
+		.events = POLL_IN
+	};
+	if (xpoll(&pfd, 1, 70 * 1000) <= 0) {
+		close(fd);
+		fd = -1;
+	}
+
+	unlink(fifo);
+	return fd;
 }

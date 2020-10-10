@@ -12,7 +12,6 @@
 #include <sys/wait.h>
 #include <sys/mount.h>
 
-#include <logging.hpp>
 #include <daemon.hpp>
 #include <utils.hpp>
 #include <selinux.hpp>
@@ -92,7 +91,7 @@ static shared_ptr<su_info> get_su_info(unsigned uid) {
 		info = cached;
 	}
 
-	auto g = info->lock();
+	mutex_guard lock = info->lock();
 
 	if (info->access.policy == QUERY) {
 		// Not cached, get data from database
@@ -131,7 +130,7 @@ static shared_ptr<su_info> get_su_info(unsigned uid) {
 			return info;
 
 		// If still not determined, check if manager exists
-		if (info->str[SU_MANAGER][0] == '\0') {
+		if (info->str[SU_MANAGER].empty()) {
 			info->access = NO_SU_ACCESS;
 			return info;
 		}
@@ -140,30 +139,20 @@ static shared_ptr<su_info> get_su_info(unsigned uid) {
 	}
 
 	// If still not determined, ask manager
-	struct sockaddr_un addr;
-	int sockfd = create_rand_socket(&addr);
-
-	// Connect manager
-	app_socket(addr.sun_path + 1, info);
-	int fd = socket_accept(sockfd, 60);
+	int fd = app_request(info);
 	if (fd < 0) {
 		info->access.policy = DENY;
 	} else {
-		socket_send_request(fd, info);
 		int ret = read_int_be(fd);
 		info->access.policy = ret < 0 ? DENY : static_cast<policy_t>(ret);
 		close(fd);
 	}
-	close(sockfd);
 
 	return info;
 }
 
+// Set effective uid back to root, otherwise setres[ug]id will fail if uid isn't root
 static void set_identity(unsigned uid) {
-	/*
-	 * Set effective uid back to root, otherwise setres[ug]id will fail
-	 * if uid isn't root.
-	 */
 	if (seteuid(0)) {
 		PLOGE("seteuid (root)");
 	}
@@ -201,7 +190,16 @@ void su_daemon_handler(int client, struct ucred *credential) {
 		write_int(client, DENY);
 		close(client);
 		return;
-	} else if (int child = xfork(); child) {
+	}
+
+	// Fork a child root process
+	//
+	// The child process will need to setsid, open a pseudo-terminal
+	// if needed, and eventually exec shell.
+	// The parent process will wait for the result and
+	// send the return code back to our client.
+
+	if (int child = xfork(); child) {
 		ctx.info.reset();
 
 		// Wait result
@@ -218,12 +216,6 @@ void su_daemon_handler(int client, struct ucred *credential) {
 		close(client);
 		return;
 	}
-
-	/* The child process will need to setsid, open a pseudo-terminal
-	 * if needed, and will eventually run exec.
-	 * The parent process will wait for the result and
-	 * send the return code back to our client
-	 */
 
 	LOGD("su: fork handler\n");
 
@@ -275,9 +267,9 @@ void su_daemon_handler(int client, struct ucred *credential) {
 	xdup2(errfd, STDERR_FILENO);
 
 	// Unleash all streams from SELinux hell
-	setfilecon("/proc/self/fd/0", "u:object_r:" SEPOL_FILE_DOMAIN ":s0");
-	setfilecon("/proc/self/fd/1", "u:object_r:" SEPOL_FILE_DOMAIN ":s0");
-	setfilecon("/proc/self/fd/2", "u:object_r:" SEPOL_FILE_DOMAIN ":s0");
+	setfilecon("/proc/self/fd/0", "u:object_r:" SEPOL_FILE_TYPE ":s0");
+	setfilecon("/proc/self/fd/1", "u:object_r:" SEPOL_FILE_TYPE ":s0");
+	setfilecon("/proc/self/fd/2", "u:object_r:" SEPOL_FILE_TYPE ":s0");
 
 	close(infd);
 	close(outfd);
@@ -298,6 +290,7 @@ void su_daemon_handler(int client, struct ucred *credential) {
 			break;
 		case NAMESPACE_MODE_ISOLATE:
 			LOGD("su: use new isolated namespace\n");
+			switch_mnt_ns(ctx.pid);
 			xunshare(CLONE_NEWNS);
 			xmount(nullptr, "/", nullptr, MS_PRIVATE | MS_REC, nullptr);
 			break;
@@ -337,9 +330,6 @@ void su_daemon_handler(int client, struct ucred *credential) {
 			setenv("SHELL", ctx.req.shell, 1);
 		}
 	}
-	const char *ld_path = getenv("LD_LIBRARY_PATH");
-	if (ld_path && strncmp(ld_path, ":/apex/com.android.runtime/lib", 30) == 0)
-		unsetenv("LD_LIBRARY_PATH");
 
 	// Unblock all signals
 	sigset_t block_set;

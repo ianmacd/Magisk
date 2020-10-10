@@ -1,14 +1,15 @@
 package com.topjohnwu.magisk.core.utils
 
 import android.content.Context
+import android.os.Build
 import com.topjohnwu.magisk.R
+import com.topjohnwu.magisk.core.Config
 import com.topjohnwu.magisk.core.Const
 import com.topjohnwu.magisk.core.Info
 import com.topjohnwu.magisk.core.wrap
-import com.topjohnwu.magisk.extensions.rawResource
+import com.topjohnwu.magisk.ktx.rawResource
 import com.topjohnwu.superuser.Shell
 import com.topjohnwu.superuser.ShellUtils
-import com.topjohnwu.superuser.io.SuFile
 
 class RootInit : Shell.Initializer() {
 
@@ -17,31 +18,41 @@ class RootInit : Shell.Initializer() {
     }
 
     fun init(context: Context, shell: Shell): Boolean {
-        val job = shell.newJob()
-        if (Info.env.magiskVersionCode >= Const.Version.DYNAMIC_PATH) {
-            job.add("export ASH_STANDALONE=1")
-                .add("[ -x /data/adb/magisk/busybox ] && exec /data/adb/magisk/busybox sh")
-                .add("MAGISKTMP=$(magisk --path)/.magisk")
-        } else {
-            job.add("export PATH=\"/sbin/.magisk/busybox:\$PATH\"")
-                .add("MAGISKTMP=/sbin/.magisk")
-        }
-        job.add(context.rawResource(R.raw.manager))
-        if (shell.isRoot) {
-            job.add(context.rawResource(R.raw.util_functions))
-            Const.MAGISK_DISABLE_FILE = SuFile("/cache/.disable_magisk")
-        }
-        job.add("mm_init").exec()
+        shell.newJob().apply {
+            add("export SDK_INT=${Build.VERSION.SDK_INT}")
+            if (Const.Version.atLeast_20_4()) {
+                add("export MAGISKTMP=\$(magisk --path)/.magisk")
+            } else {
+                add("export MAGISKTMP=/sbin/.magisk")
+            }
+            if (Const.Version.atLeast_21_0()) {
+                add("export ASH_STANDALONE=1")
+                add("[ -x /data/adb/magisk/busybox ] && exec /data/adb/magisk/busybox sh")
+            } else {
+                add("export PATH=\"\$MAGISKTMP/busybox:\$PATH\"")
+            }
+            add(context.rawResource(R.raw.manager))
+            if (shell.isRoot) {
+                add(context.rawResource(R.raw.util_functions))
+            }
+            add("mm_init")
+        }.exec()
 
-        fun getvar(name: String) = ShellUtils.fastCmd(shell, "echo \$$name").toBoolean()
+        fun fastCmd(cmd: String) = ShellUtils.fastCmd(shell, cmd)
+        fun getVar(name: String) = fastCmd("echo \$$name")
+        fun getBool(name: String) = getVar(name).toBoolean()
 
-        Const.MAGISKTMP = ShellUtils.fastCmd(shell, "echo \$MAGISKTMP")
-        Info.keepVerity = getvar("KEEPVERITY")
-        Info.keepEnc = getvar("KEEPFORCEENCRYPT")
-        Info.isSAR = getvar("SYSTEM_ROOT")
-        Info.ramdisk = shell.newJob().add("check_boot_ramdisk").exec().isSuccess
-        Info.recovery = getvar("RECOVERYMODE")
-        Info.isAB = getvar("ISAB")
+        Const.MAGISKTMP = getVar("MAGISKTMP")
+        Info.isSAR = getBool("SYSTEM_ROOT")
+        Info.ramdisk = getBool("RAMDISKEXIST")
+        Info.isAB = getBool("ISAB")
+        Info.crypto = getVar("CRYPTOTYPE")
+        Info.isPixel = fastCmd("getprop ro.product.brand") == "google"
+
+        // Default presets
+        Config.recovery = getBool("RECOVERYMODE")
+        Config.keepVerity = getBool("KEEPVERITY")
+        Config.keepEnc = getBool("KEEPFORCEENCRYPT")
 
         return true
     }

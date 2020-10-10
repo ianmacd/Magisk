@@ -7,25 +7,20 @@
 #include <selinux.hpp>
 #include <daemon.hpp>
 #include <resetprop.hpp>
-#include <flags.h>
 
 using namespace std;
 
-#ifdef MAGISK_DEBUG
-#define VLOGI(tag, from, to) LOGI("%-8s: %s <- %s\n", tag, to, from)
-#else
-#define VLOGI(tag, from, to) LOGI("%-8s: %s\n", tag, to)
-#endif
+#define VLOGD(tag, from, to) LOGD("%-8s: %s <- %s\n", tag, to, from)
 
-#define TYPE_INTER   (1 << 0)    /* intermediate node */
-#define TYPE_MIRROR  (1 << 1)    /* mount from mirror */
+#define TYPE_MIRROR  (1 << 0)    /* mount from mirror */
+#define TYPE_INTER   (1 << 1)    /* intermediate node */
 #define TYPE_SKEL    (1 << 2)    /* replace with tmpfs */
 #define TYPE_MODULE  (1 << 3)    /* mount from module */
 #define TYPE_ROOT    (1 << 4)    /* partition root */
 #define TYPE_CUSTOM  (1 << 5)    /* custom node type overrides all */
-#define TYPE_DIR     (TYPE_INTER|TYPE_MIRROR|TYPE_SKEL|TYPE_ROOT)
+#define TYPE_DIR     (TYPE_INTER|TYPE_SKEL|TYPE_ROOT)
 
-vector<string> module_list;
+static vector<string> module_list;
 
 class node_entry;
 class dir_node;
@@ -40,7 +35,7 @@ template<class T> static bool isa(node_entry *node);
 static int bind_mount(const char *from, const char *to) {
 	int ret = xmount(from, to, nullptr, MS_BIND, nullptr);
 	if (ret == 0)
-		VLOGI("bind_mnt", from, to);
+		VLOGD("bind_mnt", from, to);
 	return ret;
 }
 
@@ -86,14 +81,14 @@ protected:
 
 	/* Use top bit of _file_type for node exist status */
 	bool exist() { return static_cast<bool>(_file_type & (1 << 7)); }
-	void set_exist() { _file_type |= (1 << 7); }
+	void set_exist(bool b) { if (b) _file_type |= (1 << 7); else _file_type &= ~(1 << 7); }
 	uint8_t file_type() { return static_cast<uint8_t>(_file_type & ~(1 << 7)); }
 
 private:
 	friend void merge_node(node_entry *a, node_entry *b);
 	friend class dir_node;
 
-	bool need_clone();
+	bool need_skel_upgrade(node_entry *child);
 
 	// Node properties
 	string _name;
@@ -113,7 +108,11 @@ public:
 	typedef map<string_view, node_entry *> map_type;
 	typedef map_type::iterator map_iter;
 
-	~dir_node() override;
+	~dir_node() override {
+		for (auto &it : children)
+			delete it.second;
+		children.clear();
+	}
 
 	// Return false to indicate need to upgrade to module
 	bool collect_files(const char *module, int dfd);
@@ -191,13 +190,6 @@ protected:
 	template<class T>
 	dir_node(const char *name, T *self) : dir_node(name, DT_DIR, self) {}
 
-private:
-	// Root node lookup cache
-	root_node *_root;
-
-	// dir nodes host children
-	map_type children;
-
 	template<class T = node_entry>
 	T *iter_to_node(const map_iter &it) {
 		return reinterpret_cast<T*>(it == children.end() ? nullptr : it->second);
@@ -226,6 +218,12 @@ private:
 			return node;
 		});
 	}
+
+	// dir nodes host children
+	map_type children;
+
+	// Root node lookup cache
+	root_node *_root;
 };
 
 class root_node : public dir_node {
@@ -243,22 +241,6 @@ private:
 	friend class module_node;
 };
 
-void node_entry::create_and_mount(const string &src) {
-	const string &dest = node_path();
-	if (is_lnk()) {
-		VLOGI("cp_link", src.data(), dest.data());
-		cp_afc(src.data(), dest.data());
-	} else {
-		if (is_dir())
-			xmkdir(dest.data(), 0);
-		else if (is_reg())
-			close(xopen(dest.data(), O_RDONLY | O_CREAT | O_CLOEXEC, 0));
-		else
-			return;
-		bind_mount(src.data(), dest.data());
-	}
-}
-
 class module_node : public node_entry {
 public:
 	module_node(const char *module, dirent *entry)
@@ -270,44 +252,23 @@ public:
 
 	module_node(inter_node *node) : module_node(node, node->module) {}
 
-	void mount() override {
-		string src = module_mnt + module + parent()->root()->prefix + node_path();
-		if (exist())
-			clone_attr(mirror_path().data(), src.data());
-		if (isa<skel_node>(parent()))
-			create_and_mount(src);
-		else if (is_dir() || is_reg())
-			bind_mount(src.data(), node_path().data());
-	}
-
+	void mount() override;
 private:
 	const char *module;
 };
 
-class mirror_node : public dir_node {
+class mirror_node : public node_entry {
 public:
-	mirror_node(dirent *entry) : dir_node(entry->d_name, entry->d_type, this) {}
-
+	mirror_node(dirent *entry) : node_entry(entry->d_name, entry->d_type, this) {}
 	void mount() override {
 		create_and_mount(mirror_path());
-		dir_node::mount();
 	}
 };
 
 class skel_node : public dir_node {
 public:
-	skel_node(node_entry *node) : dir_node(node, this) {}
-
-	void mount() override {
-		string src = mirror_path();
-		const string &dest = node_path();
-		file_attr a;
-		getattr(src.data(), &a);
-		xmount("tmpfs", dest.data(), "tmpfs", 0, nullptr);
-		VLOGI("mnt_tmp", "tmpfs", dest.data());
-		setattr(dest.data(), &a);
-		dir_node::mount();
-	}
+	skel_node(node_entry *node);
+	void mount() override;
 };
 
 // Poor man's dynamic cast without RTTI
@@ -346,11 +307,9 @@ const string &node_entry::node_path() {
 	return _node_path;
 }
 
-dir_node::~dir_node() {
-	for (auto &it : children)
-		delete it.second;
-	children.clear();
-}
+/*************************
+ * Node Tree Construction
+ *************************/
 
 template<typename Func>
 dir_node::map_iter dir_node::insert(dir_node::map_iter it, uint8_t type, Func fn, bool allow_same) {
@@ -394,56 +353,71 @@ node_entry* dir_node::extract(string_view name) {
 	return nullptr;
 }
 
-bool node_entry::need_clone() {
-	/* We need to upgrade parent to skeleton if:
+skel_node::skel_node(node_entry *node) : dir_node(node, this) {
+	string mirror = mirror_path();
+	if (auto dir = open_dir(mirror.data()); dir) {
+		set_exist(true);
+		for (dirent *entry; (entry = xreaddir(dir.get()));) {
+			// Insert mirror nodes
+			emplace<mirror_node>(entry->d_name, entry);
+		}
+	} else {
+		// It is actually possible that mirror does not exist (nested mount points)
+		// Set self to non exist so this node will be ignored at mount
+		set_exist(false);
+		return;
+	}
+
+	for (auto it = children.begin(); it != children.end(); ++it) {
+		// Need to upgrade all inter_node children to skel_node
+		if (isa<inter_node>(it->second))
+			it = upgrade<skel_node>(it);
+	}
+}
+
+bool node_entry::need_skel_upgrade(node_entry *child) {
+	/* We need to upgrade to skeleton if:
 	 * - Target does not exist
 	 * - Source or target is a symlink */
-	bool clone = false;
+	bool upgrade = false;
 	struct stat st;
-	if (lstat(node_path().data(), &st) != 0) {
-		clone = true;
+	if (lstat(child->node_path().data(), &st) != 0) {
+		upgrade = true;
 	} else {
-		set_exist();  // cache exist result
-		if (is_lnk() || S_ISLNK(st.st_mode))
-			clone = true;
+		child->set_exist(true);
+		if (child->is_lnk() || S_ISLNK(st.st_mode))
+			upgrade = true;
 	}
-	return clone;
+	return upgrade;
 }
 
 bool dir_node::prepare() {
-	bool upgrade_skel = false;
+	bool to_skel = false;
 	for (auto it = children.begin(); it != children.end();) {
-		auto child = it->second;
-		if (child->need_clone()) {
+		if (need_skel_upgrade(it->second)) {
 			if (node_type > type_id<skel_node>()) {
-				// Upgrade will fail, remove unsupported child node
-				delete child;
+				// Upgrade will fail, remove the unsupported child node
+				delete it->second;
 				it = children.erase(it);
 				continue;
 			}
 			// Tell parent to upgrade self to skel
-			upgrade_skel = true;
+			to_skel = true;
 			// If child is inter_node, upgrade to module
 			if (auto nit = upgrade<module_node, inter_node>(it); nit != children.end()) {
 				it = nit;
-				goto increment;
+				goto next_node;
 			}
 		}
-		if (auto dn = dyn_cast<dir_node>(child); dn && dn->is_dir() && !dn->prepare()) {
-			// Upgrade child to skeleton (shall always success)
+		if (auto dn = dyn_cast<dir_node>(it->second); dn && dn->is_dir() && !dn->prepare()) {
+			// Upgrade child to skeleton
 			it = upgrade<skel_node>(it);
-			auto skel = iter_to_node<skel_node>(it);
-			string mirror = skel->mirror_path();
-			auto dir = xopen_dir(mirror.data());
-			for (dirent *entry; (entry = xreaddir(dir.get()));) {
-				// Insert mirror nodes
-				skel->emplace<mirror_node>(entry->d_name, entry);
-			}
 		}
-increment:
+next_node:
 		++it;
+		continue;
 	}
-	return !upgrade_skel;
+	return !to_skel;
 }
 
 bool dir_node::collect_files(const char *module, int dfd) {
@@ -471,6 +445,57 @@ bool dir_node::collect_files(const char *module, int dfd) {
 	return true;
 }
 
+/************************
+ * Mount Implementations
+ ************************/
+
+void node_entry::create_and_mount(const string &src) {
+	const string &dest = node_path();
+	if (is_lnk()) {
+		VLOGD("cp_link", src.data(), dest.data());
+		cp_afc(src.data(), dest.data());
+	} else {
+		if (is_dir())
+			xmkdir(dest.data(), 0);
+		else if (is_reg())
+			close(xopen(dest.data(), O_RDONLY | O_CREAT | O_CLOEXEC, 0));
+		else
+			return;
+		bind_mount(src.data(), dest.data());
+	}
+}
+
+void module_node::mount() {
+	string src = module_mnt + module + parent()->root()->prefix + node_path();
+	if (exist())
+		clone_attr(mirror_path().data(), src.data());
+	if (isa<skel_node>(parent()))
+		create_and_mount(src);
+	else if (is_dir() || is_reg())
+		bind_mount(src.data(), node_path().data());
+}
+
+void skel_node::mount() {
+	if (!exist())
+		return;
+	string src = mirror_path();
+	const string &dest = node_path();
+	file_attr a;
+	getattr(src.data(), &a);
+	mkdir(dest.data(), 0);
+	if (!isa<skel_node>(parent())) {
+		// We don't need another layer of tmpfs if parent is skel
+		xmount("tmpfs", dest.data(), "tmpfs", 0, nullptr);
+		VLOGD("mnt_tmp", "tmpfs", dest.data());
+	}
+	setattr(dest.data(), &a);
+	dir_node::mount();
+}
+
+/****************
+ * Magisk Stuffs
+ ****************/
+
 class magisk_node : public node_entry {
 public:
 	magisk_node(const char *name) : node_entry(name, DT_REG, this) {}
@@ -480,13 +505,13 @@ public:
 		if (name() == "magisk") {
 			for (int i = 0; applet_names[i]; ++i) {
 				string dest = dir_name + "/" + applet_names[i];
-				VLOGI("create", "./magisk", dest.data());
+				VLOGD("create", "./magisk", dest.data());
 				xsymlink("./magisk", dest.data());
 			}
 		} else {
 			for (int i = 0; init_applet[i]; ++i) {
 				string dest = dir_name + "/" + init_applet[i];
-				VLOGI("create", "./magiskinit", dest.data());
+				VLOGD("create", "./magiskinit", dest.data());
 				xsymlink("./magiskinit", dest.data());
 			}
 		}
@@ -512,7 +537,7 @@ static void inject_magisk_bins(root_node *system) {
 		delete bin->extract(init_applet[i]);
 }
 
-static void mount_modules() {
+void magic_mount() {
 	node_entry::mirror_dir = MAGISKTMP + "/" MIRRDIR;
 	node_entry::module_mnt = MAGISKTMP + "/" MODULEMNT "/";
 
@@ -593,7 +618,12 @@ static void prepare_modules() {
 			if (entry->d_type == DT_DIR) {
 				// Cleanup old module if exists
 				if (faccessat(mfd, entry->d_name, F_OK, 0) == 0) {
-					frm_rf(xopenat(mfd, entry->d_name, O_RDONLY | O_CLOEXEC));
+					int modfd = xopenat(mfd, entry->d_name, O_RDONLY | O_CLOEXEC);
+					if (faccessat(modfd, "disable", F_OK, 0) == 0) {
+						auto disable = entry->d_name + "/disable"s;
+						close(xopenat(ufd, disable.data(), O_RDONLY | O_CREAT | O_CLOEXEC, 0));
+					}
+					frm_rf(modfd);
 					unlinkat(mfd, entry->d_name, AT_REMOVEDIR);
 				}
 				LOGI("Upgrade / New module: %s\n", entry->d_name);
@@ -615,29 +645,25 @@ static void prepare_modules() {
 
 static void collect_modules() {
 	auto dir = xopen_dir(MODULEROOT);
+	if (!dir)
+		return;
 	int dfd = dirfd(dir.get());
 	for (dirent *entry; (entry = xreaddir(dir.get()));) {
-		if (entry->d_type == DT_DIR) {
-			if (entry->d_name == ".core"sv)
-				continue;
-
+		if (entry->d_type == DT_DIR && entry->d_name != ".core"sv) {
 			int modfd = xopenat(dfd, entry->d_name, O_RDONLY);
-			run_finally f([=]{ close(modfd); });
-
 			if (faccessat(modfd, "remove", F_OK, 0) == 0) {
 				LOGI("%s: remove\n", entry->d_name);
 				auto uninstaller = MODULEROOT + "/"s + entry->d_name + "/uninstall.sh";
 				if (access(uninstaller.data(), F_OK) == 0)
 					exec_script(uninstaller.data());
-				frm_rf(xdup(modfd));
+				frm_rf(modfd);
 				unlinkat(dfd, entry->d_name, AT_REMOVEDIR);
 				continue;
 			}
-
 			unlinkat(modfd, "update", 0);
-
 			if (faccessat(modfd, "disable", F_OK, 0) != 0)
 				module_list.emplace_back(entry->d_name);
+			close(modfd);
 		}
 	}
 }
@@ -645,14 +671,32 @@ static void collect_modules() {
 void handle_modules() {
 	prepare_modules();
 	collect_modules();
-
-	// Execute module scripts
-	LOGI("* Running module post-fs-data scripts\n");
-	exec_module_script("post-fs-data", module_list);
+	exec_module_scripts("post-fs-data");
 
 	// Recollect modules (module scripts could remove itself)
 	module_list.clear();
 	collect_modules();
+}
 
-	mount_modules();
+void foreach_modules(const char *name) {
+	LOGI("* Add %s to all modules\n", name);
+	auto dir = open_dir(MODULEROOT);
+	if (!dir)
+		return;
+
+	int dfd = dirfd(dir.get());
+	for (dirent *entry; (entry = xreaddir(dir.get()));) {
+		if (entry->d_type == DT_DIR) {
+			if (entry->d_name == ".core"sv)
+				continue;
+
+			int modfd = xopenat(dfd, entry->d_name, O_RDONLY | O_CLOEXEC);
+			close(xopenat(modfd, name, O_RDONLY | O_CREAT | O_CLOEXEC, 0));
+			close(modfd);
+		}
+	}
+}
+
+void exec_module_scripts(const char *stage) {
+	exec_module_scripts(stage, module_list);
 }

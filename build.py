@@ -55,14 +55,12 @@ arch64 = ['arm64-v8a', 'x86_64']
 support_targets = ['magisk', 'magiskinit', 'magiskboot', 'magiskpolicy', 'resetprop', 'busybox', 'test']
 default_targets = ['magisk', 'magiskinit', 'magiskboot', 'busybox']
 
-ndk_ver = '21'
-ndk_ver_full = '21.0.6113669'
-build_tools_ver = '29.0.3'
+ndk_ver = '21c'
+ndk_ver_full = '21.2.6472646'
 
 ndk_root = op.join(os.environ['ANDROID_HOME'], 'ndk')
 ndk_path = op.join(ndk_root, 'magisk')
 ndk_build = op.join(ndk_path, 'ndk-build')
-build_tools = op.join(os.environ['ANDROID_HOME'], 'build-tools', build_tools_ver)
 gradlew = op.join('.', 'gradlew' + ('.bat' if is_windows else ''))
 
 # Global vars
@@ -201,12 +199,12 @@ def sign_zip(unsigned, output, release):
         mv(unsigned, output)
         return
 
-    signer_name = 'zipsigner-3.0.jar'
-    zipsigner = op.join('signing', 'build', 'libs', signer_name)
+    signer_name = 'zipsigner-4.0.jar'
+    zipsigner = op.join('app', 'signing', 'build', 'libs', signer_name)
 
     if not op.exists(zipsigner):
         header('* Building ' + signer_name)
-        proc = execv([gradlew, 'signing:shadowJar'])
+        proc = execv([gradlew, 'app:signing:shadowJar'])
         if proc.returncode != 0:
             error(f'Build {signer_name} failed!')
 
@@ -299,7 +297,7 @@ def build_binary(args):
 
     header('* Building binaries: ' + ' '.join(args.target))
 
-    os.utime(op.join('native', 'jni', 'include', 'flags.h'))
+    os.utime(op.join('native', 'jni', 'include', 'flags.hpp'))
 
     # Basic flags
     global base_flags
@@ -345,56 +343,37 @@ def build_apk(args, module):
 
     source = op.join(module, 'build', 'outputs', 'apk', build_type, apk)
     target = op.join(config['outdir'], apk)
-
-    if args.release:
-        zipalign = op.join(build_tools, 'zipalign' + ('.exe' if is_windows else ''))
-        aapt2 = op.join(build_tools, 'aapt2' + ('.exe' if is_windows else ''))
-        apksigner = op.join(build_tools, 'apksigner' + ('.bat' if is_windows else ''))
-        try:
-            with tempfile.NamedTemporaryFile(delete=False) as f:
-                tmp = f.name
-
-            # AAPT2 optimization
-            execv([aapt2, 'optimize', '-o', tmp, '--enable-resource-obfuscation',
-                  '--enable-resource-path-shortening', source])
-
-            # Recompress everything just to piss people off
-            with zipfile.ZipFile(source, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
-                with zipfile.ZipFile(tmp) as zin:
-                    for e in zin.namelist():
-                        zout.writestr(e, zin.read(e))
-
-            # Zipalign
-            execv([zipalign, '-f', '4', source, target])
-
-            # Sign APK
-            execv([apksigner, 'sign', '--v1-signer-name', 'CERT',
-                  '--ks', config['keyStore'],
-                  '--ks-pass', f'pass:{config["keyStorePass"]}',
-                  '--ks-key-alias', config['keyAlias'],
-                  '--key-pass', f'pass:{config["keyPass"]}', target])
-        finally:
-            rm(tmp)
-            rm(source)
-    else:
-        mv(source, target)
-
+    mv(source, target)
     header('Output: ' + target)
     return target
 
 
 def build_app(args):
     header('* Building Magisk Manager')
-    source = op.join('scripts', 'util_functions.sh')
-    target = op.join('app', 'src', 'main',
-                     'res', 'raw', 'util_functions.sh')
-    cp(source, target)
     build_apk(args, 'app')
 
 
 def build_stub(args):
     header('* Building Magisk Manager stub')
     build_apk(args, 'stub')
+
+
+def build_snet(args):
+    if not op.exists(op.join('snet', 'src', 'main', 'java', 'com', 'topjohnwu', 'snet')):
+        error('snet sources have to be bind mounted on top of the stub folder')
+    header('* Building snet extension')
+    proc = execv([gradlew, 'stub:assembleRelease'])
+    if proc.returncode != 0:
+        error('Build snet extention failed!')
+    source = op.join('stub', 'build', 'outputs', 'apk',
+                     'release', 'stub-release.apk')
+    target = op.join(config['outdir'], 'snet.jar')
+    # Extract classes.dex
+    with zipfile.ZipFile(target, 'w', compression=zipfile.ZIP_DEFLATED, allowZip64=False) as zout:
+        with zipfile.ZipFile(source) as zin:
+            zout.writestr('classes.dex', zin.read('classes.dex'))
+    rm(source)
+    header('Output: ' + target)
 
 
 def zip_main(args):
@@ -560,10 +539,11 @@ def setup_ndk(args):
     rm_rf(op.join(ndk_path, 'sysroot'))
 
     header('* Replacing API-16 static libs')
-    for arch in ['arm', 'i686']:
+    for target in ['arm-linux-androideabi', 'i686-linux-android']:
+      arch = target.split('-')[0]
       lib_dir = op.join(
         ndk_path, 'toolchains', 'llvm', 'prebuilt', f'{os_name}-x86_64',
-        'sysroot', 'usr', 'lib', f'{arch}-linux-androideabi', '16')
+        'sysroot', 'usr', 'lib', f'{target}', '16')
       src_dir = op.join('tools', 'ndk-bins', arch)
       # Remove stupid macOS crap
       rm(op.join(src_dir, '.DS_Store'))
@@ -574,7 +554,7 @@ def setup_ndk(args):
     src_prop = op.join(ndk_path, 'source.properties')
     props = parse_props(src_prop)
     props['Pkg.Revision.orig'] = props['Pkg.Revision']
-    props['Pkg.Revision'] = '0.0.0'
+    props['Pkg.Revision'] = '99.99.99'
     with open(src_prop, 'w') as p:
         for key, val in props.items():
             print(f'{key} = {val}', file=p)
@@ -614,6 +594,12 @@ app_parser.set_defaults(func=build_app)
 stub_parser = subparsers.add_parser(
     'stub', help='build stub Magisk Manager')
 stub_parser.set_defaults(func=build_stub)
+
+# Need to bind mount snet sources on top of stub folder
+# Note: source code for the snet extension is *NOT* public
+snet_parser = subparsers.add_parser(
+    'snet', help='build snet extension')
+snet_parser.set_defaults(func=build_snet)
 
 zip_parser = subparsers.add_parser(
     'zip', help='zip Magisk into a flashable zip')

@@ -1,17 +1,13 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/sysmacros.h>
-#include <stdio.h>
-#include <string.h>
 #include <fcntl.h>
 #include <libgen.h>
 #include <vector>
 
 #include <xz.h>
 #include <magisk.hpp>
-#include <cpio.hpp>
 #include <utils.hpp>
-#include <flags.h>
 
 #include "binaries.h"
 #ifdef USE_64BIT
@@ -27,46 +23,60 @@ using namespace std;
 constexpr int (*init_applet_main[])(int, char *[]) =
 		{ magiskpolicy_main, magiskpolicy_main, nullptr };
 
-#ifdef MAGISK_DEBUG
-static FILE *kmsg;
-static char kmsg_buf[4096];
-static int vprintk(const char *fmt, va_list ap) {
-	vsnprintf(kmsg_buf + 12, sizeof(kmsg_buf) - 12, fmt, ap);
-	return fprintf(kmsg, "%s", kmsg_buf);
-}
-void setup_klog() {
-	// Shut down first 3 fds
-	int fd;
-	if (access("/dev/null", W_OK) == 0) {
-		fd = xopen("/dev/null", O_RDWR | O_CLOEXEC);
-	} else {
-		mknod("/null", S_IFCHR | 0666, makedev(1, 3));
-		fd = xopen("/null", O_RDWR | O_CLOEXEC);
-		unlink("/null");
+int data_holder::patch(str_pairs list) {
+	int count = 0;
+	for (uint8_t *p = buf, *eof = buf + sz; p < eof; ++p) {
+		for (auto [from, to] : list) {
+			if (memcmp(p, from.data(), from.length() + 1) == 0) {
+				LOGD("Replace [%s] -> [%s]\n", from.data(), to.data());
+				memset(p, 0, from.length());
+				memcpy(p, to.data(), to.length());
+				++count;
+				p += from.length();
+			}
+		}
 	}
-	xdup3(fd, STDIN_FILENO, O_CLOEXEC);
-	xdup3(fd, STDOUT_FILENO, O_CLOEXEC);
-	xdup3(fd, STDERR_FILENO, O_CLOEXEC);
-	if (fd > STDERR_FILENO)
-		close(fd);
-
-	if (access("/dev/kmsg", W_OK) == 0) {
-		fd = xopen("/dev/kmsg", O_WRONLY | O_CLOEXEC);
-	} else {
-		mknod("/kmsg", S_IFCHR | 0666, makedev(1, 11));
-		fd = xopen("/kmsg", O_WRONLY | O_CLOEXEC);
-		unlink("/kmsg");
-	}
-
-	kmsg = fdopen(fd, "w");
-	setbuf(kmsg, nullptr);
-	log_cb.d = log_cb.i = log_cb.w = log_cb.e = vprintk;
-	log_cb.ex = nop_ex;
-	strcpy(kmsg_buf, "magiskinit: ");
+	return count;
 }
-#else
-void setup_klog() {}
-#endif
+
+bool data_holder::contains(string_view pattern) {
+	for (uint8_t *p = buf, *eof = buf + sz; p < eof; ++p) {
+		if (memcmp(p, pattern.data(), pattern.length() + 1) == 0)
+			return true;
+	}
+	return false;
+}
+
+void data_holder::consume(data_holder &other) {
+	buf = other.buf;
+	sz = other.sz;
+	other.buf = nullptr;
+	other.sz = 0;
+}
+
+auto_data<HEAP> raw_data::read(int fd) {
+	auto_data<HEAP> data;
+	fd_full_read(fd, data.buf, data.sz);
+	return data;
+}
+
+auto_data<HEAP> raw_data::read(const char *name) {
+	auto_data<HEAP> data;
+	full_read(name, data.buf, data.sz);
+	return data;
+}
+
+auto_data<MMAP> raw_data::mmap_rw(const char *name) {
+	auto_data<MMAP> data;
+	::mmap_rw(name, data.buf, data.sz);
+	return data;
+}
+
+auto_data<MMAP> raw_data::mmap_ro(const char *name) {
+	auto_data<MMAP> data;
+	::mmap_ro(name, data.buf, data.sz);
+	return data;
+}
 
 static bool unxz(int fd, const uint8_t *buf, size_t size) {
 	uint8_t out[8192];
@@ -89,25 +99,6 @@ static bool unxz(int fd, const uint8_t *buf, size_t size) {
 		b.out_pos = 0;
 	} while (b.in_pos != size);
 	return true;
-}
-
-static void decompress_ramdisk() {
-	constexpr char tmp[] = "tmp.cpio";
-	constexpr char ramdisk_xz[] = "ramdisk.cpio.xz";
-	if (access(ramdisk_xz, F_OK))
-		return;
-	LOGD("Decompressing ramdisk from %s\n", ramdisk_xz);
-	uint8_t *buf;
-	size_t sz;
-	mmap_ro(ramdisk_xz, buf, sz);
-	int fd = xopen(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-	unxz(fd, buf, sz);
-	munmap(buf, sz);
-	close(fd);
-	cpio_mmap cpio(tmp);
-	cpio.extract();
-	unlink(tmp);
-	unlink(ramdisk_xz);
 }
 
 int dump_magisk(const char *path, mode_t mode) {
@@ -193,7 +184,7 @@ int main(int argc, char *argv[]) {
 			return (*init_applet_main[i])(argc, argv);
 	}
 
-#ifdef MAGISK_DEBUG
+#if 0
 	if (getenv("INIT_TEST") != nullptr)
 		return test_main(argc, argv);
 #endif
@@ -207,25 +198,24 @@ int main(int argc, char *argv[]) {
 
 	if (getpid() != 1)
 		return 1;
-	setup_klog();
 
 	BaseInit *init;
 	cmdline cmd{};
 
 	if (argc > 1 && argv[1] == "selinux_setup"sv) {
+		setup_klog();
 		init = new SecondStageInit(argv);
 	} else {
 		// This will also mount /sys and /proc
 		load_kernel_info(&cmd);
 
-		bool two_stage = access("/apex", F_OK) == 0;
+		bool two_stage = check_two_stage();
 		if (cmd.skip_initramfs) {
 			if (two_stage)
 				init = new SARFirstStageInit(argv, &cmd);
 			else
 				init = new SARInit(argv, &cmd);
 		} else {
-			decompress_ramdisk();
 			if (cmd.force_normal_boot)
 				init = new FirstStageInit(argv, &cmd);
 			else if (access("/sbin/recovery", F_OK) == 0 || access("/system/bin/recovery", F_OK) == 0)

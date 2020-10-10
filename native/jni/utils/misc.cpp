@@ -13,9 +13,11 @@
 #include <unistd.h>
 #include <syscall.h>
 #include <random>
+#include <string>
 
-#include <logging.hpp>
 #include <utils.hpp>
+
+using namespace std;
 
 int fork_dont_care() {
 	int pid = xfork();
@@ -123,9 +125,9 @@ int exec_command_sync(exec_t &exec) {
 	return WEXITSTATUS(status);
 }
 
-int new_daemon_thread(void *(*start_routine) (void *), void *arg, const pthread_attr_t *attr) {
+int new_daemon_thread(thread_entry entry, void *arg, const pthread_attr_t *attr) {
 	pthread_t thread;
-	int ret = xpthread_create(&thread, attr, start_routine, arg);
+	int ret = xpthread_create(&thread, attr, entry, arg);
 	if (ret == 0)
 		pthread_detach(thread);
 	return ret;
@@ -138,8 +140,8 @@ static void *proxy_routine(void *fp) {
 	return nullptr;
 }
 
-int new_daemon_thread(std::function<void()> &&fn) {
-	return new_daemon_thread(proxy_routine, new std::function<void()>(std::move(fn)));
+int new_daemon_thread(std::function<void()> &&entry) {
+	return new_daemon_thread(proxy_routine, new std::function<void()>(std::move(entry)));
 }
 
 static char *argv0;
@@ -159,14 +161,6 @@ bool ends_with(const std::string_view &s1, const std::string_view &s2) {
 	unsigned l1 = s1.length();
 	unsigned l2 = s2.length();
 	return l1 < l2 ? false : s1.compare(l1 - l2, l2, s2) == 0;
-}
-
-char *rtrim(char *str) {
-	int len = strlen(str);
-	while (len > 0 && str[len - 1] == ' ')
-		--len;
-	str[len] = '\0';
-	return str;
 }
 
 /*
@@ -213,4 +207,13 @@ int switch_mnt_ns(int pid) {
 	ret = xsetns(fd, 0);
 	close(fd);
 	return ret;
+}
+
+string &replace_all(string &str, string_view from, string_view to) {
+	size_t pos = 0;
+	while((pos = str.find(from, pos)) != string::npos) {
+		str.replace(pos, from.length(), to);
+		pos += to.length();
+	}
+	return str;
 }

@@ -2,6 +2,10 @@
 # Magisk Manager internal scripts
 ##################################
 
+run_delay() {
+  (sleep $1; $2)&
+}
+
 env_check() {
   for file in busybox magisk magiskboot magiskinit util_functions.sh boot_patch.sh; do
     [ -f $MAGISKBIN/$file ] || return 1
@@ -34,29 +38,6 @@ direct_install() {
   return 0
 }
 
-mm_patch_dtb() {
-  (local result=1
-  local PATCHED=$TMPDIR/dt.patched
-  for name in dtb dtbo; do
-    local IMAGE=`find_block $name$SLOT`
-    if [ ! -z $IMAGE ]; then
-      if $MAGISKBIN/magiskboot dtb $IMAGE patch $PATCHED; then
-        result=0
-        if [ ! -z $SHA1 ]; then
-          # Backup stuffs
-          mkdir /data/magisk_backup_${SHA1} 2>/dev/null
-          cat $IMAGE | gzip -9 > /data/magisk_backup_${SHA1}/${name}.img.gz
-        fi
-        cat $PATCHED /dev/zero > $IMAGE
-        rm -f $PATCHED
-      fi
-    fi
-  done
-  # Run broadcast command passed from app
-  eval $1
-  )& >/dev/null 2>&1
-}
-
 restore_imgs() {
   [ -z $SHA1 ] && return 1
   local BACKUPDIR=/data/magisk_backup_$SHA1
@@ -67,7 +48,7 @@ restore_imgs() {
 
   for name in dtb dtbo; do
     [ -f $BACKUPDIR/${name}.img.gz ] || continue
-    local IMAGE=`find_block $name$SLOT`
+    local IMAGE=$(find_block $name$SLOT)
     [ -z $IMAGE ] && continue
     flash_image $BACKUPDIR/${name}.img.gz $IMAGE
   done
@@ -79,7 +60,7 @@ post_ota() {
   cd $1
   chmod 755 bootctl
   ./bootctl hal-info || return
-  [ `./bootctl get-current-slot` -eq 0 ] && SLOT_NUM=1 || SLOT_NUM=0
+  [ $(./bootctl get-current-slot) -eq 0 ] && SLOT_NUM=1 || SLOT_NUM=0
   ./bootctl set-active-boot-slot $SLOT_NUM
   cat << EOF > post-fs-data.d/post_ota.sh
 ${1}/bootctl mark-boot-successful
@@ -108,13 +89,13 @@ EOF
   cd /
 }
 
-force_pm_install() {
-  local APK=$1
-  local VERIFY=`settings get global package_verifier_enable`
-  [ "$VERIFY" -eq 1 ] && settings put global package_verifier_enable 0
-  pm install -r $APK
+adb_pm_install() {
+  local tmp=/data/local/tmp/patched.apk
+  cp -f "$1" $tmp
+  chmod 644 $tmp
+  su 2000 -c pm install $tmp || pm install $tmp
   local res=$?
-  [ "$VERIFY" -eq 1 ] && settings put global package_verifier_enable 1
+  rm -f $tmp
   return $res
 }
 
@@ -122,20 +103,42 @@ check_boot_ramdisk() {
   # Create boolean ISAB
   [ -z $SLOT ] && ISAB=false || ISAB=true
 
-  # If we are running as recovery mode, then we do not have ramdisk in boot
-  $RECOVERYMODE && return 1
+  # If we are running as recovery mode, then we do not have ramdisk
+  [ "$RECOVERYMODE" = "true" ] && return 1
 
   # If we are A/B, then we must have ramdisk
   $ISAB && return 0
 
-  # If we are using legacy SAR, but not AB, we do not have ramdisk in boot
+  # If we are using legacy SAR, but not A/B, assume we do not have ramdisk
   if grep ' / ' /proc/mounts | grep -q '/dev/root'; then
-    # Override recovery mode to true
-    RECOVERYMODE=true
+    # Override recovery mode to true if not set
+    [ -z $RECOVERYMODE ] && RECOVERYMODE=true
     return 1
   fi
 
   return 0
+}
+
+check_encryption() {
+  if $ISENCRYPTED; then
+    if [ $SDK_INT -lt 24 ]; then
+      CRYPTOTYPE="block"
+    else
+      # First see what the system tells us
+      CRYPTOTYPE=$(getprop ro.crypto.type)
+      if [ -z $CRYPTOTYPE ]; then
+        # If not mounting through device mapper, we are FBE
+        if grep ' /data ' /proc/mounts | grep -qv 'dm-'; then
+          CRYPTOTYPE="file"
+        else
+          # We are either FDE or metadata encryption (which is also FBE)
+          grep -q ' /metadata ' /proc/mounts && CRYPTOTYPE="file" || CRYPTOTYPE="block"
+        fi
+      fi
+    fi
+  else
+    CRYPTOTYPE="N/A"
+  fi
 }
 
 ##########################
@@ -143,15 +146,16 @@ check_boot_ramdisk() {
 ##########################
 
 mount_partitions() {
-  [ "`getprop ro.build.ab_update`" = "true" ] && SLOT=`getprop ro.boot.slot_suffix`
+  [ "$(getprop ro.build.ab_update)" = "true" ] && SLOT=$(getprop ro.boot.slot_suffix)
   # Check whether non rootfs root dir exists
   grep ' / ' /proc/mounts | grep -qv 'rootfs' && SYSTEM_ROOT=true || SYSTEM_ROOT=false
 }
 
 get_flags() {
-  $SYSTEM_ROOT && KEEPVERITY=true || KEEPVERITY=false
-  [ "`getprop ro.crypto.state`" = "encrypted" ] && KEEPFORCEENCRYPT=true || KEEPFORCEENCRYPT=false
-  RECOVERYMODE=false
+  KEEPVERITY=$SYSTEM_ROOT
+  [ "$(getprop ro.crypto.state)" = "encrypted" ] && ISENCRYPTED=true || ISENCRYPTED=false
+  KEEPFORCEENCRYPT=$ISENCRYPTED
+  # Do NOT preset RECOVERYMODE here
 }
 
 run_migrations() { return; }
@@ -168,4 +172,8 @@ mm_init() {
   get_flags
   run_migrations
   SHA1=$(grep_prop SHA1 $MAGISKTMP/config)
+  check_boot_ramdisk && RAMDISKEXIST=true || RAMDISKEXIST=false
+  check_encryption
+  # Make sure RECOVERYMODE has value
+  [ -z $RECOVERYMODE ] && RECOVERYMODE=false
 }

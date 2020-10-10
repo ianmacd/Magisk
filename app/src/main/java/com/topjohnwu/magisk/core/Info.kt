@@ -1,47 +1,47 @@
 package com.topjohnwu.magisk.core
 
-import com.github.pwittchen.reactivenetwork.library.rx2.ReactiveNetwork
-import com.topjohnwu.magisk.BuildConfig
+import androidx.databinding.ObservableBoolean
 import com.topjohnwu.magisk.DynAPK
 import com.topjohnwu.magisk.core.model.UpdateInfo
-import com.topjohnwu.magisk.extensions.get
-import com.topjohnwu.magisk.extensions.subscribeK
+import com.topjohnwu.magisk.core.utils.net.NetworkObserver
+import com.topjohnwu.magisk.ktx.get
 import com.topjohnwu.magisk.utils.CachedValue
-import com.topjohnwu.magisk.utils.KObservableField
 import com.topjohnwu.superuser.Shell
 import com.topjohnwu.superuser.ShellUtils.fastCmd
+import com.topjohnwu.superuser.internal.UiThreadHandler
 import java.io.FileInputStream
 import java.io.IOException
+import java.util.*
 
 val isRunningAsStub get() = Info.stub != null
-val isCanaryVersion = !BuildConfig.VERSION_NAME.contains(".")
 
 object Info {
 
     val envRef = CachedValue { loadState() }
 
-    @JvmStatic
-    val env by envRef              // Local
-    var remote = UpdateInfo()      // Remote
-    @JvmStatic
-    var stub: DynAPK.Data? = null  // Stub
+    @JvmStatic val env by envRef
 
-    // Toggle-able options
-    @JvmStatic var keepVerity = false
-    @JvmStatic var keepEnc = false
-    @JvmStatic var recovery = false
+    var stub: DynAPK.Data? = null
+    val stubChk: DynAPK.Data
+        get() = stub as DynAPK.Data
 
-    // Immutable device state
+    var remote = UpdateInfo()
+
+    // Device state
+    var crypto = ""
     @JvmStatic var isSAR = false
     @JvmStatic var isAB = false
+    @JvmStatic val isFDE get() = crypto == "block"
     @JvmStatic var ramdisk = false
+    @JvmStatic var hasGMS = true
+    @JvmStatic var isPixel = false
+    @JvmStatic val cryptoText get() = crypto.capitalize(Locale.US)
 
     val isConnected by lazy {
-        KObservableField(false).also { field ->
-            ReactiveNetwork.observeNetworkConnectivity(get())
-                .subscribeK {
-                    field.value = it.available()
-                }
+        ObservableBoolean(false).also { field ->
+            NetworkObserver.observe(get()) {
+                UiThreadHandler.run { field.set(it) }
+            }
         }
     }
 

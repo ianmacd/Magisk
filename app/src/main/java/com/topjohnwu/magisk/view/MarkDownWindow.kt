@@ -4,55 +4,51 @@ import android.content.Context
 import android.view.LayoutInflater
 import android.widget.TextView
 import com.topjohnwu.magisk.R
-import com.topjohnwu.magisk.data.repository.StringRepository
-import com.topjohnwu.magisk.extensions.subscribeK
+import com.topjohnwu.magisk.data.repository.NetworkService
+import com.topjohnwu.magisk.ktx.coroutineScope
 import io.noties.markwon.Markwon
-import io.reactivex.Completable
-import io.reactivex.Single
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.koin.core.KoinComponent
 import org.koin.core.inject
 import timber.log.Timber
-import java.io.InputStream
-import java.util.*
+import kotlin.coroutines.coroutineContext
 
 object MarkDownWindow : KoinComponent {
 
-    private val stringRepo: StringRepository by inject()
+    private val svc: NetworkService by inject()
     private val markwon: Markwon by inject()
 
-    fun show(activity: Context, title: String?, url: String) {
-        show(activity, title, stringRepo.getString(url))
+    suspend fun show(activity: Context, title: String?, url: String) {
+        show(activity, title) {
+            svc.fetchString(url)
+        }
     }
 
-    fun show(activity: Context, title: String?, input: InputStream) {
-        Single.just(Scanner(input, "UTF-8").apply { useDelimiter("\\A") })
-            .map { it.next() }
-            .also {
-                show(activity, title, it)
+    suspend fun show(activity: Context, title: String?, input: suspend () -> String) {
+        val view = LayoutInflater.from(activity).inflate(R.layout.markdown_window_md2, null)
+
+        MagiskDialog(activity)
+            .applyTitle(title ?: "")
+            .applyView(view)
+            .applyButton(MagiskDialog.ButtonType.NEGATIVE) {
+                titleRes = android.R.string.cancel
             }
-    }
+            .reveal()
 
-    fun show(activity: Context, title: String?, content: Single<String>) {
-        val mdRes = R.layout.markdown_window_md2
-        val mv = LayoutInflater.from(activity).inflate(mdRes, null)
-        val tv = mv.findViewById<TextView>(R.id.md_txt)
-
-        content.map {
-            markwon.setMarkdown(tv, it)
-        }.ignoreElement().onErrorResumeNext {
-            // Nothing we can actually do other than show error message
-            Timber.e(it)
-            tv.setText(R.string.download_file_error)
-            Completable.complete()
-        }.subscribeK {
-            MagiskDialog(activity)
-                .applyTitle(title ?: "")
-                .applyView(mv)
-                .applyButton(MagiskDialog.ButtonType.NEGATIVE) {
-                    titleRes = android.R.string.cancel
-                }
-                .reveal()
-            return@subscribeK
+        val tv = view.findViewById<TextView>(R.id.md_txt)
+        tv.coroutineScope = CoroutineScope(coroutineContext)
+        withContext(Dispatchers.IO) {
+            try {
+                markwon.setMarkdown(tv, input())
+            } catch (e: Exception) {
+                if (e is CancellationException)
+                    throw e
+                Timber.e(e)
+                tv.post { tv.setText(R.string.download_file_error) }
+            }
         }
     }
 }
